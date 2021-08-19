@@ -15,6 +15,7 @@ package com.facebook.presto.sql.tree;
 
 import com.google.common.base.Preconditions;
 
+import javax.swing.text.html.Option;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -34,6 +35,8 @@ public class BooleanLiteral
         this(Optional.empty(), value);
     }
 
+    public BooleanLiteral(boolean value) { this(Optional.empty(), value); }
+
     public BooleanLiteral(NodeLocation location, String value)
     {
         this(Optional.of(location), value);
@@ -46,6 +49,11 @@ public class BooleanLiteral
         Preconditions.checkArgument(value.toLowerCase(ENGLISH).equals("true") || value.toLowerCase(ENGLISH).equals("false"));
 
         this.value = value.toLowerCase(ENGLISH).equals("true");
+    }
+    private BooleanLiteral(Optional<NodeLocation> location, boolean value)
+    {
+        super(location);
+        this.value = value;
     }
 
     public boolean getValue()

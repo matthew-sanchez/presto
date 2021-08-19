@@ -26,7 +26,7 @@ public class Query
         extends Statement
 {
     private final Optional<With> with;
-    private final QueryBody queryBody;
+    public final QueryBody queryBody;
     private final Optional<OrderBy> orderBy;
     private final Optional<String> limit;
     private final Optional<Offset> offset;

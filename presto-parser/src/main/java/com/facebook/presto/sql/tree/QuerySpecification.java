@@ -25,14 +25,14 @@ import static java.util.Objects.requireNonNull;
 public class QuerySpecification
         extends QueryBody
 {
-    private final Select select;
-    private final Optional<Relation> from;
-    private final Optional<Expression> where;
-    private final Optional<GroupBy> groupBy;
-    private final Optional<Expression> having;
-    private final Optional<OrderBy> orderBy;
-    private final Optional<Offset> offset;
-    private final Optional<String> limit;
+    public Select select;
+    public Optional<Relation> from;
+    public Optional<Expression> where;
+    public Optional<GroupBy> groupBy;
+    public Optional<Expression> having;
+    public Optional<OrderBy> orderBy;
+    public Optional<Offset> offset;
+    public Optional<String> limit;
 
     public QuerySpecification(
             Select select,

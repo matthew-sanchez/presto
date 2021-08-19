@@ -42,8 +42,8 @@ public class LogicalBinaryExpression
     }
 
     private final Operator operator;
-    private final Expression left;
-    private final Expression right;
+    public Expression left;
+    public Expression right;
 
     public LogicalBinaryExpression(Operator operator, Expression left, Expression right)
     {

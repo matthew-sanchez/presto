@@ -50,7 +50,7 @@ import static java.util.stream.Collectors.joining;
 
 public class QueryPreparer
 {
-    private final SqlParser sqlParser;
+    public final SqlParser sqlParser;
 
     @Inject
     public QueryPreparer(SqlParser sqlParser)
