@@ -163,55 +163,71 @@ public class SenSQLModule
         return result;
     }
 
-    private Expression processWhere(LogicalBinaryExpression expression, List<String> whereList)
+    private Expression processWhere(Expression expression, List<String> whereList)
     {
         //temp to get OR working for test purposes
 //        if(expression.getOperator() == LogicalBinaryExpression.Operator.OR) {
 //            return expression;
 //        }
+
         System.out.println(expression.toString());
+
         try {
+            LogicalBinaryExpression lbExpression = (LogicalBinaryExpression) expression;
             try {
-                expression.left = processWhere((LogicalBinaryExpression) expression.left, whereList);
+                lbExpression.left = processWhere(lbExpression.left, whereList);
             }
             catch (ClassCastException e) {
             }
             try {
-                expression.right = processWhere((LogicalBinaryExpression) expression.right, whereList);
+                lbExpression.right = processWhere(lbExpression.right, whereList);
             }
             catch (ClassCastException e) {
             }
-            if (expression.left instanceof BooleanLiteral && expression.right instanceof BooleanLiteral) {
+            if (lbExpression.left instanceof BooleanLiteral && lbExpression.right instanceof BooleanLiteral) {
                 return new BooleanLiteral(true);
             }
-            else if (expression.left instanceof BooleanLiteral) {
-                return expression.right;
+            else if (lbExpression.left instanceof BooleanLiteral) {
+                return lbExpression.right;
             }
-            else if (expression.right instanceof BooleanLiteral) {
-                return expression.left;
+            else if (lbExpression.right instanceof BooleanLiteral) {
+                return lbExpression.left;
             }
             else {
-                boolean left = checkCond(expression.left, whereList);
-                boolean right = checkCond(expression.right, whereList);
+                boolean left = checkCond(lbExpression.left, whereList);
+                boolean right = checkCond(lbExpression.right, whereList);
                 if (left && right) {
-                    if (expression.getOperator().equals(LogicalBinaryExpression.Operator.AND)) {
+                    if (lbExpression.getOperator().equals(LogicalBinaryExpression.Operator.AND)) {
                         return new BooleanLiteral(true);
                     } else {
                         return new BooleanLiteral(false);
                     }
                 }
                 if (left) {
-                    return expression.right;
+                    return lbExpression.right;
                 }
                 if (right) {
-                    return expression.left;
+                    return lbExpression.left;
                 }
+                return lbExpression;
+            }
+        }
+        catch (ClassCastException e) {
+
+        }
+        try {
+            NotExpression nExpression = (NotExpression) expression;
+            if (checkCond(nExpression, whereList)) {
+                return new BooleanLiteral(true);
+            }
+            else {
                 return expression;
             }
         }
         catch (ClassCastException e) {
-            return expression;
+
         }
+        return expression;
     }
 
     private boolean checkCond(Expression condition, List<String> whereList)
@@ -247,12 +263,15 @@ public class SenSQLModule
 //        }
         try {
             if (!(condition instanceof LogicalBinaryExpression)) {
+//                System.out.println("checking condition: " + condition.toString());
 //                System.out.println("checking for 'features': " + condition.toString());
                 if (condition.toString().contains("features")) {
-//                    System.out.println("found");
-//                    this.forwardClauses.add(Condition);
 
-                    whereList.add(((StringLiteral) (((ComparisonExpression) condition).getRight())).getValue());
+                    System.out.println("found");
+//                    this.forwardClauses.add(Condition);
+                    if(!(condition instanceof NotExpression)) {
+                        whereList.add(((StringLiteral) (((ComparisonExpression) condition).getRight())).getValue());
+                    }
                     return true;
                 }
             }
@@ -262,50 +281,64 @@ public class SenSQLModule
         return false;
     }
 
-    private Expression processWhereBackend(LogicalBinaryExpression expression) {
+    private Expression processWhereBackend(Expression expression) {
         System.out.println(expression.toString());
         try {
+            LogicalBinaryExpression lbExpression = (LogicalBinaryExpression) expression;
             try {
-                expression.left = processWhereBackend((LogicalBinaryExpression) expression.left);
+                lbExpression.left = processWhereBackend(lbExpression.left);
             }
             catch (ClassCastException e) {
             }
             try {
-                expression.right = processWhereBackend((LogicalBinaryExpression) expression.right);
+                lbExpression.right = processWhereBackend(lbExpression.right);
             }
             catch (ClassCastException e) {
             }
-            if (expression.left instanceof BooleanLiteral && expression.right instanceof BooleanLiteral) {
+            if (lbExpression.left instanceof BooleanLiteral && lbExpression.right instanceof BooleanLiteral) {
                 return new BooleanLiteral(true);
             }
-            else if (expression.left instanceof BooleanLiteral) {
-                return expression.right;
+            else if (lbExpression.left instanceof BooleanLiteral) {
+                return lbExpression.right;
             }
-            else if (expression.right instanceof BooleanLiteral) {
-                return expression.left;
+            else if (lbExpression.right instanceof BooleanLiteral) {
+                return lbExpression.left;
             }
             else {
-                boolean left = checkCondBackend(expression.left);
-                boolean right = checkCondBackend(expression.right);
+                boolean left = checkCondBackend(lbExpression.left);
+                boolean right = checkCondBackend(lbExpression.right);
                 if (left && right) {
-                    if (expression.getOperator().equals(LogicalBinaryExpression.Operator.AND)) {
+                    if (lbExpression.getOperator().equals(LogicalBinaryExpression.Operator.AND)) {
                         return new BooleanLiteral(true);
                     } else {
                         return new BooleanLiteral(false);
                     }
                 }
                 if (left) {
-                    return expression.right;
+                    return lbExpression.right;
                 }
                 if (right) {
-                    return expression.left;
+                    return lbExpression.left;
                 }
                 return expression;
             }
         }
         catch (ClassCastException e) {
-            return expression;
+
         }
+        try {
+            NotExpression nExpression = (NotExpression) expression;
+            if (checkCondBackend(nExpression)) {
+                return new BooleanLiteral(true);
+            }
+            else {
+                return expression;
+            }
+        }
+        catch (ClassCastException e) {
+
+        }
+        return expression;
     }
 
     private boolean checkCondBackend(Expression condition)
