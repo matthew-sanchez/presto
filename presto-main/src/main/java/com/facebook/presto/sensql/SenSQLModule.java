@@ -19,10 +19,37 @@ import com.facebook.presto.spi.WarningCollector;
 import com.facebook.presto.sql.analyzer.SemanticException;
 import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.plan.WindowNode;
-import com.facebook.presto.sql.tree.*;
+import com.facebook.presto.sql.tree.LogicalBinaryExpression;
+import com.facebook.presto.sql.tree.QuerySpecification;
+import com.facebook.presto.sql.tree.Statement;
+import com.facebook.presto.sql.tree.Table;
+import com.facebook.presto.sql.tree.BooleanLiteral;
 import sun.jvm.hotspot.types.basic.BasicOopField;
+import com.facebook.presto.sql.tree.Query;
+import com.facebook.presto.sql.tree.Join;
+import com.facebook.presto.sql.tree.Relation;
+import com.facebook.presto.sql.tree.With;
+import com.facebook.presto.sql.tree.WithQuery;
+import com.facebook.presto.sql.tree.Union;
+import com.facebook.presto.sql.tree.Expression;
+import com.facebook.presto.sql.tree.Node;
+import com.facebook.presto.sql.tree.QueryBody;
+import com.facebook.presto.sql.tree.Identifier;
+import com.facebook.presto.sql.tree.QualifiedName;
+import com.facebook.presto.sql.tree.NotExpression;
+import com.facebook.presto.sql.tree.StringLiteral;
+import com.facebook.presto.sql.tree.ComparisonExpression;
+import com.facebook.presto.sql.tree.AstVisitor;
+
 import sun.rmi.runtime.Log;
 
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.net.Socket;
+import java.sql.Connection;
+import java.sql.Driver;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.text.ParseException;
 import java.util.*;
 
@@ -32,16 +59,62 @@ import static java.util.Objects.requireNonNull;
 public class SenSQLModule
 {
     private Map<String, Map<String, List<String>>> localdb;
+    private Connection localDB;
    // private List<Expression> forwardClauses;
 
     public SenSQLModule(Map<String, Map<String, List<String>>> map)
     {
+        System.out.println("Init SenSQLModule");
         this.localdb = map;
+        try {
+            System.out.println("attempting localDB connection");
+//            Class.forName("org.postgresql.Driver");
+//            Socket s = new Socket("localhost", 10000);
+//            PrintWriter out = new PrintWriter(s.getOutputStream(), true);
+//            out.println("HELLO");
+//            Driver driver = new Driver{}
+//            DriverManager.registerDriver();
+            Enumeration<Driver> drivers = DriverManager.getDrivers();
+            while (drivers.hasMoreElements()) {
+                Driver nextElement = drivers.nextElement();
+                System.out.println(nextElement);
+            }
+
+            this.localDB = DriverManager.getConnection("jdbc:presto://db.sece.io/geonaming");
+            System.out.println("localDB connection successful");
+        }
+        catch (SQLException e) {
+            System.out.println("FAIL");
+            System.out.println(e.getMessage());
+        }
+//        catch (IOException e) {
+//            System.out.println("socket failed");
+//        }
+//        catch (ClassNotFoundException e) {
+//            System.out.println(e.getMessage());
+//            System.out.println("FAIL");
+//        }
 //        this.forwardClauses = new LinkedList<>();
     }
 
     public QueryPreparer.PreparedQuery rewrite(QuerySpecification originalBody, QueryPreparer queryPreparer, Session session, WarningCollector warningCollector)
     {
+        try {
+            System.out.println("attempting localDB connection");
+//            Class.forName("org.postgresql.Driver");
+            Enumeration<Driver> drivers = DriverManager.getDrivers();
+            while (drivers.hasMoreElements()) {
+                Driver nextElement = drivers.nextElement();
+                System.out.println(nextElement);
+            }
+
+            this.localDB = DriverManager.getConnection("jdbc:presto:postgresql://db.sece.io/geonaming");
+            System.out.println("localDB connection successful");
+        }
+        catch (SQLException e) {
+            System.out.println("FAIL");
+            System.out.println(e.getMessage());
+        }
         // get relation name from 'from' clause
         if (originalBody.from.isPresent()) {
             originalBody.from = Optional.of(processFrom(originalBody.from.get()));
@@ -68,16 +141,19 @@ public class SenSQLModule
             System.out.println("modified where: " + originalBody.where);
         }
         System.out.println("original forwardQuery: " + forwardQuery);
-        if( forwardQuery != null) {
+        String forwardString = "";
+        if (forwardQuery != null) {
             QuerySpecification forwardBody = ((QuerySpecification) ((((Query) forwardQuery).getQueryBody())));
+
             System.out.println("-- beginning recursion --");
-            forwardBody.where = Optional.of(processWhereBackend((LogicalBinaryExpression) forwardBody.where.get()));
+            forwardBody.where = Optional.of(processWhereBackend(forwardBody.where.get()));
             System.out.println("-- end recursion --");
+            forwardString = ("modified forwardQuery: " + "select " + forwardBody.select.getSelectItems().get(0) +
+                    " from " + ((Table) ((Join) forwardBody.from.get()).getRight()).getName() + ", " + ((Table) ((Join) forwardBody.from.get()).getLeft()).getName() +
+                    " where " + forwardBody.where.get() +
+                    ";");
+            System.out.println(forwardString);
         }
-        System.out.println("modified forwardQuery: " + forwardQuery);
-
-
-
 
         System.out.print(whereList);
         // default location = 'Morningside Heights' if none found
@@ -86,8 +162,6 @@ public class SenSQLModule
         }
 
 //        System.out.println("forwardList: " + this.forwardClauses);
-
-
         QuerySpecification forwardBody = ((QuerySpecification) ((((Query) forwardQuery).getQueryBody())));
         // build tree and set to right
 //        if (this.forwardClauses.size() == 0) {
@@ -105,15 +179,10 @@ public class SenSQLModule
 //            ((LogicalBinaryExpression) (forwardBody.where.get())).right = baseWhere;
 //        }
         System.out.println(forwardBody);
-
-
-
         // create 'with' clause
         // With{[WithQuery{Union}]}
         WithQuery[] withquery = new WithQuery[1];
         List<Relation> unionRelations = new LinkedList<>();
-
-
         for (int i = 0; i < whereList.size(); i++) {
 //        if (localdb.get(whereList.get(i)).get(from).size() == 1) {
 //            withquery[0] = new WithQuery(new Identifier(from), (Query) queryPreparer.sqlParser.createStatement("select * from " + localdb.get(whereList.get(0)).get(from).get(0) + "." + from, createParsingOptions(session, warningCollector)), Optional.empty());
@@ -124,7 +193,7 @@ public class SenSQLModule
             }
         }
 
-        if(unionRelations.size() > 1) {
+        if (unionRelations.size() > 1) {
             Union union = new Union(unionRelations, Optional.of(false));
             withquery[0] = new WithQuery(new Identifier(from), new Query(Optional.empty(), union, Optional.empty(), Optional.empty(), Optional.empty()), Optional.empty());
         }
