@@ -15,8 +15,13 @@ package com.facebook.presto.dispatcher;
 
 import com.facebook.airlift.concurrent.BoundedExecutor;
 import com.facebook.presto.Session;
-import com.facebook.presto.execution.*;
+import com.facebook.presto.execution.QueryIdGenerator;
+import com.facebook.presto.execution.QueryInfo;
+import com.facebook.presto.execution.QueryManagerConfig;
+import com.facebook.presto.execution.QueryManagerStats;
+import com.facebook.presto.execution.QueryPreparer;
 import com.facebook.presto.execution.QueryPreparer.PreparedQuery;
+import com.facebook.presto.execution.QueryTracker;
 import com.facebook.presto.execution.resourceGroups.ResourceGroupManager;
 import com.facebook.presto.execution.warnings.WarningCollectorFactory;
 import com.facebook.presto.metadata.SessionPropertyManager;
@@ -45,7 +50,12 @@ import org.weakref.jmx.Managed;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
-import java.util.*;
+
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 
 import static com.facebook.presto.SystemSessionProperties.getWarningHandlingLevel;

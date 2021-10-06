@@ -43,8 +43,8 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
-import static com.google.common.base.Strings.nullToEmpty;
 import static com.facebook.airlift.discovery.client.ServiceAnnouncement.serviceAnnouncement;
+import static com.google.common.base.Strings.nullToEmpty;
 
 @Path("/v1/catalog")
 public class DynamicCatalogController
