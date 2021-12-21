@@ -45,7 +45,12 @@ import org.weakref.jmx.Managed;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
-import java.util.*;
+
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 
 import static com.facebook.presto.SystemSessionProperties.getWarningHandlingLevel;
@@ -133,6 +138,7 @@ public class DispatchManager
         localdb.put("Lerner Hall", new HashMap<>());
         localdb.get("Lerner Hall").put("measurements", new LinkedList<>());
         localdb.get("Lerner Hall").get("measurements").add("two.public");
+
 
         this.senSQLModule = new SenSQLModule(localdb);
     }
