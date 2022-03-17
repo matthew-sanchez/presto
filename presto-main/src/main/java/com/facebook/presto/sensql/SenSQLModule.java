@@ -113,7 +113,7 @@ public class SenSQLModule
             if (originalBody.where.get() instanceof BooleanLiteral) {
                 originalBody.where = Optional.empty();
             }
-            System.out.println("modified where: " + originalBody.where);
+            System.out.println("NEW modified where: " + originalBody.where);
         }
         // now start buildling the localdb query
 //        System.out.println("original localQuery: " + ((Query) localQuery).queryBody.toString());
@@ -284,7 +284,7 @@ public class SenSQLModule
 //                System.out.println("checking condition: " + condition.toString());
 //                System.out.println("checking for 'feature': " + condition.toString());
                 // This currently also removes st_*() clauses, intentional while we aren't yet geoquerying nodes
-                if (condition.toString().contains("feature")) {
+                if (condition.toString().contains("feature") || condition.toString().contains("shape")) {
 //                    System.out.println("found");
 //                    this.forwardClauses.add(Condition);
 //                    if (!(condition instanceof NotExpression)) {

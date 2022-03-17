@@ -57,13 +57,6 @@ import java.util.Set;
 import static com.facebook.airlift.discovery.client.ServiceAnnouncement.serviceAnnouncement;
 import static com.google.common.base.Strings.nullToEmpty;
 
-/*
-import org.codehaus.plexus.util.FileUtils;
-import org.postgresql.Driver;
-import org.postgresql.PGNotification;
- */
-
-
 @Path("/v1/catalog")
 public class DynamicCatalogController
 {
