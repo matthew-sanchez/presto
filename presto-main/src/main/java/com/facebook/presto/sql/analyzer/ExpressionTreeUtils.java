@@ -17,15 +17,24 @@ import com.facebook.presto.common.type.EnumType;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeWithName;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
+import com.facebook.presto.spi.SourceLocation;
 import com.facebook.presto.spi.function.FunctionHandle;
+import com.facebook.presto.spi.relation.VariableReferenceExpression;
+import com.facebook.presto.sql.tree.ArrayConstructor;
+import com.facebook.presto.sql.tree.Cast;
 import com.facebook.presto.sql.tree.ComparisonExpression;
 import com.facebook.presto.sql.tree.DefaultExpressionTraversalVisitor;
 import com.facebook.presto.sql.tree.DereferenceExpression;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.FunctionCall;
+import com.facebook.presto.sql.tree.Literal;
 import com.facebook.presto.sql.tree.Node;
+import com.facebook.presto.sql.tree.NodeLocation;
 import com.facebook.presto.sql.tree.NodeRef;
+import com.facebook.presto.sql.tree.NullLiteral;
 import com.facebook.presto.sql.tree.QualifiedName;
+import com.facebook.presto.sql.tree.Row;
+import com.facebook.presto.sql.tree.SymbolReference;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Multimap;
 
@@ -164,5 +173,83 @@ public final class ExpressionTreeUtils
         checkState(columnReferences.get(NodeRef.of(expression)).size() == 1, "Multiple field references for expression");
 
         return columnReferences.get(NodeRef.of(expression)).iterator().next();
+    }
+
+    public static boolean isNonNullConstant(Expression expression)
+    {
+        Expression tempExpression = expression;
+        while (tempExpression instanceof Cast) {
+            tempExpression = ((Cast) tempExpression).getExpression();
+        }
+
+        if (tempExpression instanceof NullLiteral) {
+            return false;
+        }
+
+        // now allow for things like ARRAY, ROW(...) where null is OK
+        return isConstant(tempExpression);
+    }
+
+    public static boolean isConstant(Expression expression)
+    {
+        Expression tempExpression = expression;
+        while (tempExpression instanceof Cast) {
+            tempExpression = ((Cast) tempExpression).getExpression();
+        }
+
+        if (tempExpression instanceof Literal || tempExpression instanceof ArrayConstructor) {
+            return true;
+        }
+
+        // ROW an MAP are special so we explicitly do that here.
+        if (tempExpression instanceof Row) {
+            return (((Row) tempExpression).getItems().stream().allMatch(ExpressionTreeUtils::isConstant));
+        }
+
+        if (tempExpression instanceof FunctionCall) {
+            // Hack to just allow map constructor
+            if (((FunctionCall) tempExpression).getName().getSuffix().equalsIgnoreCase("map")) {
+                return ((FunctionCall) tempExpression).getArguments().stream().allMatch(ExpressionTreeUtils::isConstant);
+            }
+        }
+
+        // Everything else is considered non-const
+        return false;
+    }
+
+    public static Optional<SourceLocation> getSourceLocation(Optional<NodeLocation> nodeLocation)
+    {
+        return nodeLocation.isPresent()
+                ? Optional.of(new SourceLocation(nodeLocation.get().getLineNumber(), nodeLocation.get().getColumnNumber()))
+                : Optional.empty();
+    }
+
+    public static Optional<SourceLocation> getSourceLocation(Node node)
+    {
+        Optional<NodeLocation> nodeLocation = node.getLocation();
+        if (!node.getLocation().isPresent()) {
+            // See if any child has a location
+            nodeLocation = node.getChildren().stream()
+                    .map(x -> x.getLocation())
+                    .filter(Optional::isPresent)
+                    .findFirst()
+                    .map(x -> x.get());
+        }
+
+        return getSourceLocation(nodeLocation);
+    }
+
+    public static Optional<NodeLocation> getNodeLocation(Optional<SourceLocation> sourceLocation)
+    {
+        if (sourceLocation.isPresent()) {
+            return Optional.of(new NodeLocation(sourceLocation.get().getLine(), sourceLocation.get().getColumn()));
+        }
+
+        return Optional.empty();
+    }
+
+    public static SymbolReference createSymbolReference(VariableReferenceExpression variableReferenceExpression)
+    {
+        return new SymbolReference(getNodeLocation(variableReferenceExpression.getSourceLocation()), variableReferenceExpression.getName());
     }
 }

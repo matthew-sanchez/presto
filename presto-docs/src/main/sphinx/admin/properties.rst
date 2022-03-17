@@ -5,6 +5,11 @@ Properties Reference
 This section describes the most important config properties that
 may be used to tune Presto or alter its behavior when required.
 
+The following pages are not a complete list of all configuration and
+session properties available in Presto, and do not include any connector-specific
+catalog configuration properties. For more information on catalog configuration
+properties, refer to the :doc:`connector documentation </connector/>`.
+
 .. contents::
     :local:
     :backlinks: none
@@ -162,13 +167,24 @@ Spilling Properties
 
     This config property can be overridden by the ``join_spill_enabled`` session property.
 
+``experimental.aggregation-spill-enabled``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    * **Type:** ``boolean``
+    * **Default value:** ``true``
+
+    When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for aggregations to
+    avoid exceeding memory limits for the query.
+
+    This config property can be overridden by the ``aggregation_spill_enabled`` session property.
+
 ``experimental.distinct-aggregation-spill-enabled``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
     * **Type:** ``boolean``
     * **Default value:** ``true``
 
-    When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for distinct
+    When ``aggregation_spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for distinct
     aggregations to avoid exceeding memory limits for the query.
 
     This config property can be overridden by the ``distinct_aggregation_spill_enabled`` session property.
@@ -179,10 +195,32 @@ Spilling Properties
     * **Type:** ``boolean``
     * **Default value:** ``true``
 
-    When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for order by
+    When ``aggregation_spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for order by
     aggregations to avoid exceeding memory limits for the query.
 
     This config property can be overridden by the ``order_by_aggregation_spill_enabled`` session property.
+
+``experimental.window-spill-enabled``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    * **Type:** ``boolean``
+    * **Default value:** ``true``
+
+    When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for window functions to
+    avoid exceeding memory limits for the query.
+
+    This config property can be overridden by the ``window_spill_enabled`` session property.
+
+``experimental.order-by-spill-enabled``
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+    * **Type:** ``boolean``
+    * **Default value:** ``true``
+
+    When ``spill_enabled`` is ``true``, this determines whether Presto will try spilling memory to disk for order by to
+    avoid exceeding memory limits for the query.
+
+    This config property can be overridden by the ``order_by_spill_enabled`` session property.
 
 ``experimental.spiller.task-spilling-strategy``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -522,14 +560,19 @@ Node Scheduler Properties
     * **Type:** ``integer``
     * **Default value:** ``100``
 
-    The target value for the total number of splits that can be running for
-    each worker node.
+    The target value for the number of splits that can be running for
+    each worker node, assuming all splits have the standard split weight.
 
     Using a higher value is recommended if queries are submitted in large batches
     (e.g., running a large group of reports periodically) or for connectors that
-    produce many splits that complete quickly. Increasing this value may improve
-    query latency by ensuring that the workers have enough splits to keep them
-    fully utilized.
+    produce many splits that complete quickly but do not support assigning split
+    weight values to express that to the split scheduler. Increasing this value
+    may improve query latency by ensuring that the workers have enough splits to
+    keep them fully utilized.
+
+    When connectors do support weight based split scheduling, the number of splits
+    assigned will depend on the weight of the individual splits. If splits are
+    small, more of them are allowed to be assigned to each worker to compensate.
 
     Setting this too high will waste memory and may result in lower performance
     due to splits not being balanced across workers. Ideally, it should be set
@@ -542,10 +585,10 @@ Node Scheduler Properties
     * **Type:** ``integer``
     * **Default value:** ``10``
 
-    The number of outstanding splits that can be queued for each worker node
-    for a single stage of a query, even when the node is already at the limit for
-    total number of splits. Allowing a minimum number of splits per stage is
-    required to prevent starvation and deadlocks.
+    The number of outstanding splits with the standard split weight that can be
+    queued for each worker node for a single stage of a query, even when the
+    node is already at the limit for total number of splits. Allowing a minimum
+    number of splits per stage is required to prevent starvation and deadlocks.
 
     This value must be smaller than ``node-scheduler.max-splits-per-node``,
     will usually be increased for the same reasons, and has similar drawbacks

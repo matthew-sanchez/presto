@@ -37,8 +37,6 @@ import java.nio.file.Paths;
 import java.util.List;
 
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.AggregationPartitioningMergingStrategy.LEGACY;
-import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType.PARTITIONED;
-import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinReorderingStrategy.ELIMINATE_CROSS_JOINS;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.TaskSpillingStrategy.ORDER_BY_CREATE_TIME;
 import static com.facebook.presto.sql.analyzer.RegexLibrary.JONI;
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -70,8 +68,8 @@ public class FeaturesConfig
     private double memoryCostWeight = 10;
     private double networkCostWeight = 15;
     private boolean distributedIndexJoinsEnabled;
-    private JoinDistributionType joinDistributionType = PARTITIONED;
-    private DataSize joinMaxBroadcastTableSize;
+    private JoinDistributionType joinDistributionType = JoinDistributionType.AUTOMATIC;
+    private DataSize joinMaxBroadcastTableSize = new DataSize(100, MEGABYTE);
     private boolean colocatedJoinsEnabled = true;
     private boolean groupedExecutionEnabled = true;
     private boolean recoverableGroupedExecutionEnabled;
@@ -85,7 +83,7 @@ public class FeaturesConfig
     private SingleStreamSpillerChoice singleStreamSpillerChoice = SingleStreamSpillerChoice.LOCAL_FILE;
     private String spillerTempStorage = "local";
     private DataSize maxRevocableMemoryPerTask = new DataSize(500, MEGABYTE);
-    private JoinReorderingStrategy joinReorderingStrategy = ELIMINATE_CROSS_JOINS;
+    private JoinReorderingStrategy joinReorderingStrategy = JoinReorderingStrategy.AUTOMATIC;
     private PartialMergePushdownStrategy partialMergePushdownStrategy = PartialMergePushdownStrategy.NONE;
     private int maxReorderedJoins = 9;
     private boolean redistributeWrites = true;
@@ -93,6 +91,8 @@ public class FeaturesConfig
     private DataSize writerMinSize = new DataSize(32, DataSize.Unit.MEGABYTE);
     private boolean optimizedScaleWriterProducerBuffer;
     private boolean optimizeMetadataQueries;
+    private boolean optimizeMetadataQueriesIgnoreStats;
+    private int optimizeMetadataQueriesCallThreshold = 100;
     private boolean optimizeHashGeneration = true;
     private boolean enableIntermediateAggregations;
     private boolean pushTableWriteThroughUnion = true;
@@ -124,8 +124,14 @@ public class FeaturesConfig
     private MultimapAggGroupImplementation multimapAggGroupImplementation = MultimapAggGroupImplementation.NEW;
     private boolean spillEnabled;
     private boolean joinSpillingEnabled = true;
+    private boolean aggregationSpillEnabled = true;
     private boolean distinctAggregationSpillEnabled = true;
+    private boolean dedupBasedDistinctAggregationSpillEnabled;
+    private boolean distinctAggregationLargeBlockSpillEnabled;
+    private DataSize distinctAggregationLargeBlockSizeThreshold = new DataSize(50, MEGABYTE);
     private boolean orderByAggregationSpillEnabled = true;
+    private boolean windowSpillEnabled = true;
+    private boolean orderBySpillEnabled = true;
     private DataSize aggregationOperatorUnspillMemoryLimit = new DataSize(4, DataSize.Unit.MEGABYTE);
     private List<Path> spillerSpillPaths = ImmutableList.of();
     private int spillerThreads = 4;
@@ -181,6 +187,7 @@ public class FeaturesConfig
     private boolean pushdownDereferenceEnabled;
     private boolean inlineSqlFunctions = true;
     private boolean checkAccessControlOnUtilizedColumnsOnly;
+    private boolean checkAccessControlWithSubfields;
     private boolean skipRedundantSort = true;
     private boolean isAllowWindowOrderByLiterals = true;
 
@@ -203,7 +210,16 @@ public class FeaturesConfig
     private boolean materializedViewDataConsistencyEnabled = true;
 
     private boolean queryOptimizationWithMaterializedViewEnabled;
-    private boolean aggregationIfToFilterRewriteEnabled = true;
+    private AggregationIfToFilterRewriteStrategy aggregationIfToFilterRewriteStrategy = AggregationIfToFilterRewriteStrategy.DISABLED;
+    private boolean verboseRuntimeStatsEnabled;
+    private boolean hashBasedDistinctLimitEnabled;
+    private int hashBasedDistinctLimitThreshold = 10000;
+
+    private boolean streamingForPartialAggregationEnabled;
+
+    private int maxStageCountForEagerScheduling = 25;
+
+    private double hyperloglogStandardErrorWarningThreshold = 0.004;
 
     public enum PartitioningPrecisionStrategy
     {
@@ -278,6 +294,14 @@ public class FeaturesConfig
         ALWAYS, // Always do partial aggregation
         NEVER, // Never do partial aggregation
         AUTOMATIC // Let the optimizer decide for each aggregation
+    }
+
+    public enum AggregationIfToFilterRewriteStrategy
+    {
+        DISABLED,
+        FILTER_WITH_IF, // Rewrites AGG(IF(condition, expr)) to AGG(IF(condition, expr)) FILTER (WHERE condition).
+        UNWRAP_IF_SAFE, // Rewrites AGG(IF(condition, expr)) to AGG(expr) FILTER (WHERE condition) if it is safe to do so.
+        UNWRAP_IF // Rewrites AGG(IF(condition, expr)) to AGG(expr) FILTER (WHERE condition).
     }
 
     public double getCpuCostWeight()
@@ -448,6 +472,7 @@ public class FeaturesConfig
         return this;
     }
 
+    @NotNull
     public DataSize getJoinMaxBroadcastTableSize()
     {
         return joinMaxBroadcastTableSize;
@@ -738,10 +763,36 @@ public class FeaturesConfig
     }
 
     @Config("optimizer.optimize-metadata-queries")
-    @ConfigDescription("Enable optimization for metadata queries. Note if metadata entry has empty data, the result might be different (e.g. empty Hive partition)")
+    @ConfigDescription("Enable optimization for metadata queries if the resulting partitions are not empty according to the partition stats")
     public FeaturesConfig setOptimizeMetadataQueries(boolean optimizeMetadataQueries)
     {
         this.optimizeMetadataQueries = optimizeMetadataQueries;
+        return this;
+    }
+
+    public boolean isOptimizeMetadataQueriesIgnoreStats()
+    {
+        return optimizeMetadataQueriesIgnoreStats;
+    }
+
+    @Config("optimizer.optimize-metadata-queries-ignore-stats")
+    @ConfigDescription("Enable optimization for metadata queries. Note if metadata entry has empty data, the result might be different (e.g. empty Hive partition)")
+    public FeaturesConfig setOptimizeMetadataQueriesIgnoreStats(boolean optimizeMetadataQueriesIgnoreStats)
+    {
+        this.optimizeMetadataQueriesIgnoreStats = optimizeMetadataQueriesIgnoreStats;
+        return this;
+    }
+
+    public int getOptimizeMetadataQueriesCallThreshold()
+    {
+        return optimizeMetadataQueriesCallThreshold;
+    }
+
+    @Config("optimizer.optimize-metadata-queries-call-threshold")
+    @ConfigDescription("The threshold number of service calls to metastore, used in optimization for metadata queries")
+    public FeaturesConfig setOptimizeMetadataQueriesCallThreshold(int optimizeMetadataQueriesCallThreshold)
+    {
+        this.optimizeMetadataQueriesCallThreshold = optimizeMetadataQueriesCallThreshold;
         return this;
     }
 
@@ -903,8 +954,21 @@ public class FeaturesConfig
         return this;
     }
 
+    @Config("experimental.aggregation-spill-enabled")
+    @ConfigDescription("Spill aggregations if spill is enabled")
+    public FeaturesConfig setAggregationSpillEnabled(boolean aggregationSpillEnabled)
+    {
+        this.aggregationSpillEnabled = aggregationSpillEnabled;
+        return this;
+    }
+
+    public boolean isAggregationSpillEnabled()
+    {
+        return aggregationSpillEnabled;
+    }
+
     @Config("experimental.distinct-aggregation-spill-enabled")
-    @ConfigDescription("Spill distinct aggregations if spill is enabled")
+    @ConfigDescription("Spill distinct aggregations if aggregation spill is enabled")
     public FeaturesConfig setDistinctAggregationSpillEnabled(boolean distinctAggregationSpillEnabled)
     {
         this.distinctAggregationSpillEnabled = distinctAggregationSpillEnabled;
@@ -916,8 +980,47 @@ public class FeaturesConfig
         return distinctAggregationSpillEnabled;
     }
 
+    @Config("experimental.dedup-based-distinct-aggregation-spill-enabled")
+    @ConfigDescription("Dedup input data for Distinct Aggregates before spilling")
+    public FeaturesConfig setDedupBasedDistinctAggregationSpillEnabled(boolean dedupBasedDistinctAggregationSpillEnabled)
+    {
+        this.dedupBasedDistinctAggregationSpillEnabled = dedupBasedDistinctAggregationSpillEnabled;
+        return this;
+    }
+
+    public boolean isDedupBasedDistinctAggregationSpillEnabled()
+    {
+        return dedupBasedDistinctAggregationSpillEnabled;
+    }
+
+    @Config("experimental.distinct-aggregation-large-block-spill-enabled")
+    @ConfigDescription("Spill large block to a separate spill file")
+    public FeaturesConfig setDistinctAggregationLargeBlockSpillEnabled(boolean distinctAggregationLargeBlockSpillEnabled)
+    {
+        this.distinctAggregationLargeBlockSpillEnabled = distinctAggregationLargeBlockSpillEnabled;
+        return this;
+    }
+
+    public boolean isDistinctAggregationLargeBlockSpillEnabled()
+    {
+        return distinctAggregationLargeBlockSpillEnabled;
+    }
+
+    @Config("experimental.distinct-aggregation-large-block-size-threshold")
+    @ConfigDescription("Block size threshold beyond which it will be spilled into a separate spill file")
+    public FeaturesConfig setDistinctAggregationLargeBlockSizeThreshold(DataSize distinctAggregationLargeBlockSizeThreshold)
+    {
+        this.distinctAggregationLargeBlockSizeThreshold = distinctAggregationLargeBlockSizeThreshold;
+        return this;
+    }
+
+    public DataSize getDistinctAggregationLargeBlockSizeThreshold()
+    {
+        return distinctAggregationLargeBlockSizeThreshold;
+    }
+
     @Config("experimental.order-by-aggregation-spill-enabled")
-    @ConfigDescription("Spill order-by aggregations if spill is enabled")
+    @ConfigDescription("Spill order-by aggregations if aggregation spill is enabled")
     public FeaturesConfig setOrderByAggregationSpillEnabled(boolean orderByAggregationSpillEnabled)
     {
         this.orderByAggregationSpillEnabled = orderByAggregationSpillEnabled;
@@ -927,6 +1030,32 @@ public class FeaturesConfig
     public boolean isOrderByAggregationSpillEnabled()
     {
         return orderByAggregationSpillEnabled;
+    }
+
+    @Config("experimental.window-spill-enabled")
+    @ConfigDescription("Enable Window Operator Spilling if spill is enabled")
+    public FeaturesConfig setWindowSpillEnabled(boolean windowSpillEnabled)
+    {
+        this.windowSpillEnabled = windowSpillEnabled;
+        return this;
+    }
+
+    public boolean isWindowSpillEnabled()
+    {
+        return windowSpillEnabled;
+    }
+
+    @Config("experimental.order-by-spill-enabled")
+    @ConfigDescription("Enable Order-by Operator Spilling if spill is enabled")
+    public FeaturesConfig setOrderBySpillEnabled(boolean orderBySpillEnabled)
+    {
+        this.orderBySpillEnabled = orderBySpillEnabled;
+        return this;
+    }
+
+    public boolean isOrderBySpillEnabled()
+    {
+        return orderBySpillEnabled;
     }
 
     public boolean isIterativeOptimizerEnabled()
@@ -1595,6 +1724,18 @@ public class FeaturesConfig
         return this;
     }
 
+    public boolean isCheckAccessControlWithSubfields()
+    {
+        return checkAccessControlWithSubfields;
+    }
+
+    @Config("check-access-control-with-subfields")
+    public FeaturesConfig setCheckAccessControlWithSubfields(boolean checkAccessControlWithSubfields)
+    {
+        this.checkAccessControlWithSubfields = checkAccessControlWithSubfields;
+        return this;
+    }
+
     public boolean isSkipRedundantSort()
     {
         return skipRedundantSort;
@@ -1782,16 +1923,94 @@ public class FeaturesConfig
         return this;
     }
 
-    public boolean isAggregationIfToFilterRewriteEnabled()
+    public boolean isVerboseRuntimeStatsEnabled()
     {
-        return aggregationIfToFilterRewriteEnabled;
+        return verboseRuntimeStatsEnabled;
     }
 
-    @Config("optimizer.aggregation-if-to-filter-rewrite-enabled")
-    @ConfigDescription("Enable rewriting the IF expression inside an aggregation function to a filter clause outside the aggregation")
-    public FeaturesConfig setAggregationIfToFilterRewriteEnabled(boolean value)
+    @Config("verbose-runtime-stats-enabled")
+    @ConfigDescription("Enable logging all runtime stats.")
+    public FeaturesConfig setVerboseRuntimeStatsEnabled(boolean value)
     {
-        this.aggregationIfToFilterRewriteEnabled = value;
+        this.verboseRuntimeStatsEnabled = value;
+        return this;
+    }
+
+    public AggregationIfToFilterRewriteStrategy getAggregationIfToFilterRewriteStrategy()
+    {
+        return aggregationIfToFilterRewriteStrategy;
+    }
+
+    @Config("optimizer.aggregation-if-to-filter-rewrite-strategy")
+    @ConfigDescription("Set the strategy used to rewrite AGG IF to AGG FILTER")
+    public FeaturesConfig setAggregationIfToFilterRewriteStrategy(AggregationIfToFilterRewriteStrategy strategy)
+    {
+        this.aggregationIfToFilterRewriteStrategy = strategy;
+        return this;
+    }
+
+    public boolean isHashBasedDistinctLimitEnabled()
+    {
+        return hashBasedDistinctLimitEnabled;
+    }
+
+    @Config("hash-based-distinct-limit-enabled")
+    @ConfigDescription("Enable fast hash-based distinct limit")
+    public FeaturesConfig setHashBasedDistinctLimitEnabled(boolean hashBasedDistinctLimitEnabled)
+    {
+        this.hashBasedDistinctLimitEnabled = hashBasedDistinctLimitEnabled;
+        return this;
+    }
+
+    @Config("hash-based-distinct-limit-threshold")
+    @ConfigDescription("Threshold for fast hash-based distinct limit")
+    public FeaturesConfig setHashBasedDistinctLimitThreshold(int hashBasedDistinctLimitThreshold)
+    {
+        this.hashBasedDistinctLimitThreshold = hashBasedDistinctLimitThreshold;
+        return this;
+    }
+
+    public int getHashBasedDistinctLimitThreshold()
+    {
+        return hashBasedDistinctLimitThreshold;
+    }
+
+    public boolean isStreamingForPartialAggregationEnabled()
+    {
+        return streamingForPartialAggregationEnabled;
+    }
+
+    @Config("streaming-for-partial-aggregation-enabled")
+    public FeaturesConfig setStreamingForPartialAggregationEnabled(boolean streamingForPartialAggregationEnabled)
+    {
+        this.streamingForPartialAggregationEnabled = streamingForPartialAggregationEnabled;
+        return this;
+    }
+
+    public int getMaxStageCountForEagerScheduling()
+    {
+        return maxStageCountForEagerScheduling;
+    }
+
+    @Min(1)
+    @Config("execution-policy.max-stage-count-for-eager-scheduling")
+    @ConfigDescription("When execution policy is set to adaptive, this number determines when to switch to phased execution.")
+    public FeaturesConfig setMaxStageCountForEagerScheduling(int maxStageCountForEagerScheduling)
+    {
+        this.maxStageCountForEagerScheduling = maxStageCountForEagerScheduling;
+        return this;
+    }
+
+    public double getHyperloglogStandardErrorWarningThreshold()
+    {
+        return hyperloglogStandardErrorWarningThreshold;
+    }
+
+    @Config("hyperloglog-standard-error-warning-threshold")
+    @ConfigDescription("aggregation functions can produce low-precision results when the max standard error lower than this value.")
+    public FeaturesConfig setHyperloglogStandardErrorWarningThreshold(double hyperloglogStandardErrorWarningThreshold)
+    {
+        this.hyperloglogStandardErrorWarningThreshold = hyperloglogStandardErrorWarningThreshold;
         return this;
     }
 }

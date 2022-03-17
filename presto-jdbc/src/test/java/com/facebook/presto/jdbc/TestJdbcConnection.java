@@ -32,8 +32,12 @@ import com.google.inject.Module;
 import com.google.inject.Scopes;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -61,6 +65,12 @@ public class TestJdbcConnection
 {
     private TestingPrestoServer server;
 
+    @DataProvider(name = "customHeaderWithSpecialCharacter")
+    public static Object[][] customHeaderWithSpecialCharacter()
+    {
+        return new Object[][] {{"test.com:1234"}, {"test@test.com"}};
+    }
+
     @BeforeClass
     public void setupServer()
             throws Exception
@@ -73,7 +83,7 @@ public class TestJdbcConnection
         server.installPlugin(new HiveHadoop2Plugin());
         server.createCatalog("hive", "hive-hadoop2", ImmutableMap.<String, String>builder()
                 .put("hive.metastore", "file")
-                .put("hive.metastore.catalog.dir", server.getBaseDataDir().resolve("hive").toAbsolutePath().toString())
+                .put("hive.metastore.catalog.dir", server.getBaseDataDir().resolve("hive").toFile().toURI().toString())
                 .put("hive.security", "sql-standard")
                 .build());
 
@@ -172,7 +182,7 @@ public class TestJdbcConnection
     {
         try (Connection connection = createConnection("sessionProperties=query_max_run_time:2d;max_failed_task_percentage:0.6")) {
             assertThat(listSession(connection))
-                    .contains("join_distribution_type|PARTITIONED|PARTITIONED")
+                    .contains("join_distribution_type|AUTOMATIC|AUTOMATIC")
                     .contains("exchange_compression|false|false")
                     .contains("query_max_run_time|2d|100.00d")
                     .contains("max_failed_task_percentage|0.6|0.3");
@@ -182,7 +192,7 @@ public class TestJdbcConnection
             }
 
             assertThat(listSession(connection))
-                    .contains("join_distribution_type|BROADCAST|PARTITIONED")
+                    .contains("join_distribution_type|BROADCAST|AUTOMATIC")
                     .contains("exchange_compression|false|false");
 
             try (Statement statement = connection.createStatement()) {
@@ -190,7 +200,7 @@ public class TestJdbcConnection
             }
 
             assertThat(listSession(connection))
-                    .contains("join_distribution_type|BROADCAST|PARTITIONED")
+                    .contains("join_distribution_type|BROADCAST|AUTOMATIC")
                     .contains("exchange_compression|true|false");
         }
     }
@@ -245,6 +255,32 @@ public class TestJdbcConnection
         PrestoConnection prestoConnection = connection.unwrap(PrestoConnection.class);
         assertEquals(prestoConnection.getExtraCredentials(), credentials);
         assertEquals(listExtraCredentials(connection), credentials);
+    }
+
+    @Test
+    public void testCustomHeaders()
+            throws SQLException, UnsupportedEncodingException
+    {
+        Map<String, String> customHeadersMap = ImmutableMap.of("testHeaderKey", "testHeaderValue");
+        String customHeaders = "testHeaderKey:testHeaderValue";
+        String encodedCustomHeaders = URLEncoder.encode(customHeaders, StandardCharsets.UTF_8.toString());
+        Connection connection = createConnection("customHeaders=" + encodedCustomHeaders);
+        assertTrue(connection instanceof PrestoConnection);
+        PrestoConnection prestoConnection = connection.unwrap(PrestoConnection.class);
+        assertEquals(prestoConnection.getCustomHeaders(), customHeadersMap);
+    }
+
+    @Test(dataProvider = "customHeaderWithSpecialCharacter")
+    public void testCustomHeadersWithSpecialCharacters(String testHeaderValue)
+            throws SQLException, UnsupportedEncodingException
+    {
+        Map<String, String> customHeadersMap = ImmutableMap.of("testHeaderKey", URLEncoder.encode(testHeaderValue, StandardCharsets.UTF_8.toString()));
+        String customHeaders = "testHeaderKey:" + URLEncoder.encode(testHeaderValue, StandardCharsets.UTF_8.toString()) + "";
+        String encodedCustomHeaders = URLEncoder.encode(customHeaders, StandardCharsets.UTF_8.toString());
+        Connection connection = createConnection("customHeaders=" + encodedCustomHeaders);
+        assertTrue(connection instanceof PrestoConnection);
+        PrestoConnection prestoConnection = connection.unwrap(PrestoConnection.class);
+        assertEquals(prestoConnection.getCustomHeaders(), customHeadersMap);
     }
 
     @Test

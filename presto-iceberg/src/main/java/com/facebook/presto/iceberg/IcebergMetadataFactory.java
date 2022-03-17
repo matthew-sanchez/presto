@@ -17,9 +17,12 @@ import com.facebook.airlift.json.JsonCodec;
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.hive.HdfsEnvironment;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
+import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.connector.ConnectorMetadata;
 
 import javax.inject.Inject;
 
+import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static java.util.Objects.requireNonNull;
 
 public class IcebergMetadataFactory
@@ -28,32 +31,35 @@ public class IcebergMetadataFactory
     private final HdfsEnvironment hdfsEnvironment;
     private final TypeManager typeManager;
     private final JsonCodec<CommitTaskData> commitTaskCodec;
+    private final IcebergResourceFactory resourceFactory;
+    private final CatalogType catalogType;
 
     @Inject
     public IcebergMetadataFactory(
             IcebergConfig config,
-            ExtendedHiveMetastore metastore,
-            HdfsEnvironment hdfsEnvironment,
-            TypeManager typeManager,
-            JsonCodec<CommitTaskData> commitTaskDataJsonCodec)
-    {
-        this(metastore, hdfsEnvironment, typeManager, commitTaskDataJsonCodec);
-    }
-
-    public IcebergMetadataFactory(
+            IcebergResourceFactory resourceFactory,
             ExtendedHiveMetastore metastore,
             HdfsEnvironment hdfsEnvironment,
             TypeManager typeManager,
             JsonCodec<CommitTaskData> commitTaskCodec)
     {
+        this.resourceFactory = requireNonNull(resourceFactory, "resourceFactory is null");
         this.metastore = requireNonNull(metastore, "metastore is null");
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");
         this.typeManager = requireNonNull(typeManager, "typeManager is null");
         this.commitTaskCodec = requireNonNull(commitTaskCodec, "commitTaskCodec is null");
+        requireNonNull(config, "config is null");
+        this.catalogType = config.getCatalogType();
     }
 
-    public IcebergMetadata create()
+    public ConnectorMetadata create()
     {
-        return new IcebergMetadata(metastore, hdfsEnvironment, typeManager, commitTaskCodec);
+        switch (catalogType) {
+            case HADOOP:
+                return new IcebergHadoopMetadata(resourceFactory, typeManager, commitTaskCodec);
+            case HIVE:
+                return new IcebergHiveMetadata(metastore, hdfsEnvironment, typeManager, commitTaskCodec);
+        }
+        throw new PrestoException(NOT_SUPPORTED, "Unsupported Presto Iceberg catalog type " + catalogType);
     }
 }

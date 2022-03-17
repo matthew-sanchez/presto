@@ -18,6 +18,7 @@ import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.common.type.TypeSignature;
 import com.facebook.presto.cost.StatsAndCosts;
+import com.facebook.presto.execution.QueryInfo;
 import com.facebook.presto.hive.HiveSessionProperties.InsertExistingPartitionsBehavior;
 import com.facebook.presto.metadata.InsertTableHandle;
 import com.facebook.presto.metadata.Metadata;
@@ -51,6 +52,7 @@ import com.facebook.presto.testing.QueryRunner;
 import com.facebook.presto.tests.AbstractTestIntegrationSmokeTest;
 import com.facebook.presto.tests.DistributedQueryRunner;
 import com.facebook.presto.tests.QueryAssertions;
+import com.facebook.presto.tests.ResultWithQueryId;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
@@ -61,6 +63,7 @@ import org.testng.annotations.Test;
 
 import java.io.File;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -80,6 +83,7 @@ import static com.facebook.presto.SystemSessionProperties.CONCURRENT_LIFESPANS_P
 import static com.facebook.presto.SystemSessionProperties.EXCHANGE_MATERIALIZATION_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.GROUPED_EXECUTION;
 import static com.facebook.presto.SystemSessionProperties.JOIN_DISTRIBUTION_TYPE;
+import static com.facebook.presto.SystemSessionProperties.JOIN_REORDERING_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.PARTIAL_MERGE_PUSHDOWN_STRATEGY;
 import static com.facebook.presto.SystemSessionProperties.PARTITIONING_PROVIDER_CATALOG;
 import static com.facebook.presto.common.predicate.Marker.Bound.EXACTLY;
@@ -94,6 +98,8 @@ import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.common.type.VarcharType.createUnboundedVarcharType;
 import static com.facebook.presto.common.type.VarcharType.createVarcharType;
 import static com.facebook.presto.hive.HiveColumnHandle.BUCKET_COLUMN_NAME;
+import static com.facebook.presto.hive.HiveColumnHandle.FILE_MODIFIED_TIME_COLUMN_NAME;
+import static com.facebook.presto.hive.HiveColumnHandle.FILE_SIZE_COLUMN_NAME;
 import static com.facebook.presto.hive.HiveColumnHandle.PATH_COLUMN_NAME;
 import static com.facebook.presto.hive.HiveQueryRunner.HIVE_CATALOG;
 import static com.facebook.presto.hive.HiveQueryRunner.TPCH_SCHEMA;
@@ -107,6 +113,7 @@ import static com.facebook.presto.hive.HiveSessionProperties.PUSHDOWN_FILTER_ENA
 import static com.facebook.presto.hive.HiveSessionProperties.RCFILE_OPTIMIZED_WRITER_ENABLED;
 import static com.facebook.presto.hive.HiveSessionProperties.SORTED_WRITE_TEMP_PATH_SUBDIRECTORY_COUNT;
 import static com.facebook.presto.hive.HiveSessionProperties.SORTED_WRITE_TO_TEMP_PATH_ENABLED;
+import static com.facebook.presto.hive.HiveSessionProperties.TEMPORARY_STAGING_DIRECTORY_ENABLED;
 import static com.facebook.presto.hive.HiveSessionProperties.getInsertExistingPartitionsBehavior;
 import static com.facebook.presto.hive.HiveStorageFormat.PAGEFILE;
 import static com.facebook.presto.hive.HiveTableProperties.BUCKETED_BY_PROPERTY;
@@ -117,6 +124,8 @@ import static com.facebook.presto.hive.HiveTestUtils.FUNCTION_AND_TYPE_MANAGER;
 import static com.facebook.presto.hive.HiveUtil.columnExtraInfo;
 import static com.facebook.presto.spi.security.SelectedRole.Type.ROLE;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType.BROADCAST;
+import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinDistributionType.PARTITIONED;
+import static com.facebook.presto.sql.analyzer.FeaturesConfig.JoinReorderingStrategy.ELIMINATE_CROSS_JOINS;
 import static com.facebook.presto.sql.analyzer.FeaturesConfig.PartialMergePushdownStrategy.PUSH_THROUGH_LOW_MEMORY_OPERATORS;
 import static com.facebook.presto.sql.planner.optimizations.PlanNodeSearcher.searchFrom;
 import static com.facebook.presto.sql.planner.plan.ExchangeNode.Scope.REMOTE_MATERIALIZED;
@@ -1140,6 +1149,28 @@ public class TestHiveIntegrationSmokeTest
                 "SELECT custkey, comment " +
                 "FROM customer " +
                 "WHERE custkey < 0", 0);
+        assertQuery("SELECT count(*) FROM " + tableName, "SELECT 0");
+        assertUpdate("DROP TABLE " + tableName);
+    }
+
+    @Test
+    public void testCreateEmptyUnpartitionedBucketedTableNoStaging()
+    {
+        String tableName = "test_create_empty_bucketed_table_no_staging";
+        assertUpdate(
+                Session.builder(getSession())
+                        .setCatalogSessionProperty(catalog, TEMPORARY_STAGING_DIRECTORY_ENABLED, "false")
+                        .build(),
+                "" +
+                        "CREATE TABLE " + tableName + " " +
+                        "WITH (" +
+                        "   bucketed_by = ARRAY[ 'custkey' ], " +
+                        "   bucket_count = 11 " +
+                        ") " +
+                        "AS " +
+                        "SELECT custkey, comment " +
+                        "FROM customer " +
+                        "WHERE custkey < 0", 0);
         assertQuery("SELECT count(*) FROM " + tableName, "SELECT 0");
         assertUpdate("DROP TABLE " + tableName);
     }
@@ -2749,7 +2780,7 @@ public class TestHiveIntegrationSmokeTest
         TableMetadata tableMetadata = getTableMetadata(catalog, TPCH_SCHEMA, "test_path");
         assertEquals(tableMetadata.getMetadata().getProperties().get(STORAGE_FORMAT_PROPERTY), storageFormat);
 
-        List<String> columnNames = ImmutableList.of("col0", "col1", PATH_COLUMN_NAME);
+        List<String> columnNames = ImmutableList.of("col0", "col1", PATH_COLUMN_NAME, FILE_SIZE_COLUMN_NAME, FILE_MODIFIED_TIME_COLUMN_NAME);
         List<ColumnMetadata> columnMetadatas = tableMetadata.getColumns();
         assertEquals(columnMetadatas.size(), columnNames.size());
         for (int i = 0; i < columnMetadatas.size(); i++) {
@@ -2807,7 +2838,7 @@ public class TestHiveIntegrationSmokeTest
         assertEquals(tableMetadata.getMetadata().getProperties().get(BUCKETED_BY_PROPERTY), ImmutableList.of("col0"));
         assertEquals(tableMetadata.getMetadata().getProperties().get(BUCKET_COUNT_PROPERTY), 2);
 
-        List<String> columnNames = ImmutableList.of("col0", "col1", PATH_COLUMN_NAME, BUCKET_COLUMN_NAME);
+        List<String> columnNames = ImmutableList.of("col0", "col1", PATH_COLUMN_NAME, BUCKET_COLUMN_NAME, FILE_SIZE_COLUMN_NAME, FILE_MODIFIED_TIME_COLUMN_NAME);
         List<ColumnMetadata> columnMetadatas = tableMetadata.getColumns();
         assertEquals(columnMetadatas.size(), columnNames.size());
         for (int i = 0; i < columnMetadatas.size(); i++) {
@@ -2838,6 +2869,107 @@ public class TestHiveIntegrationSmokeTest
 
         assertUpdate("DROP TABLE test_bucket_hidden_column");
         assertFalse(getQueryRunner().tableExists(getSession(), "test_bucket_hidden_column"));
+    }
+
+    @Test
+    public void testFileSizeHiddenColumn()
+    {
+        @Language("SQL") String createTable = "CREATE TABLE test_file_size " +
+                "AS " +
+                "SELECT * FROM (VALUES " +
+                "(0, 0), (3, 0), (6, 0), " +
+                "(1, 1), (4, 1), (7, 1), " +
+                "(2, 2), (5, 2) " +
+                " ) t(col0, col1) ";
+        assertUpdate(createTable, 8);
+        assertTrue(getQueryRunner().tableExists(getSession(), "test_file_size"));
+
+        TableMetadata tableMetadata = getTableMetadata(catalog, TPCH_SCHEMA, "test_file_size");
+
+        List<String> columnNames = ImmutableList.of("col0", "col1", PATH_COLUMN_NAME, FILE_SIZE_COLUMN_NAME, FILE_MODIFIED_TIME_COLUMN_NAME);
+        List<ColumnMetadata> columnMetadatas = tableMetadata.getColumns();
+        assertEquals(columnMetadatas.size(), columnNames.size());
+        for (int i = 0; i < columnMetadatas.size(); i++) {
+            ColumnMetadata columnMetadata = columnMetadatas.get(i);
+            assertEquals(columnMetadata.getName(), columnNames.get(i));
+            if (columnMetadata.getName().equals(FILE_SIZE_COLUMN_NAME)) {
+                assertTrue(columnMetadata.isHidden());
+            }
+        }
+
+        MaterializedResult results = computeActual(format("SELECT *, \"%s\" FROM test_file_size", FILE_SIZE_COLUMN_NAME));
+        Map<Integer, Long> fileSizeMap = new HashMap<>();
+        for (int i = 0; i < results.getRowCount(); i++) {
+            MaterializedRow row = results.getMaterializedRows().get(i);
+            int col0 = (int) row.getField(0);
+            int col1 = (int) row.getField(1);
+            long fileSize = (Long) row.getField(2);
+
+            assertTrue(fileSize > 0);
+            assertEquals(col0 % 3, col1);
+            if (fileSizeMap.containsKey(col1)) {
+                assertEquals(fileSizeMap.get(col1).longValue(), fileSize);
+            }
+            else {
+                fileSizeMap.put(col1, fileSize);
+            }
+        }
+        assertEquals(fileSizeMap.size(), 3);
+
+        assertUpdate("DROP TABLE test_file_size");
+    }
+
+    @Test
+    public void testFileModifiedTimeHiddenColumn()
+    {
+        long testStartTime = Instant.now().toEpochMilli();
+
+        @Language("SQL") String createTable = "CREATE TABLE test_file_modified_time " +
+                "WITH (" +
+                "partitioned_by = ARRAY['col1']" +
+                ") AS " +
+                "SELECT * FROM (VALUES " +
+                "(0, 0), (3, 0), (6, 0), " +
+                "(1, 1), (4, 1), (7, 1), " +
+                "(2, 2), (5, 2) " +
+                " ) t(col0, col1) ";
+        assertUpdate(createTable, 8);
+        assertTrue(getQueryRunner().tableExists(getSession(), "test_file_modified_time"));
+
+        TableMetadata tableMetadata = getTableMetadata(catalog, TPCH_SCHEMA, "test_file_modified_time");
+
+        List<String> columnNames = ImmutableList.of("col0", "col1", PATH_COLUMN_NAME, FILE_SIZE_COLUMN_NAME, FILE_MODIFIED_TIME_COLUMN_NAME);
+        List<ColumnMetadata> columnMetadatas = tableMetadata.getColumns();
+        assertEquals(columnMetadatas.size(), columnNames.size());
+        for (int i = 0; i < columnMetadatas.size(); i++) {
+            ColumnMetadata columnMetadata = columnMetadatas.get(i);
+            assertEquals(columnMetadata.getName(), columnNames.get(i));
+            if (columnMetadata.getName().equals(FILE_MODIFIED_TIME_COLUMN_NAME)) {
+                assertTrue(columnMetadata.isHidden());
+            }
+        }
+        assertEquals(getPartitions("test_file_modified_time").size(), 3);
+
+        MaterializedResult results = computeActual(format("SELECT *, \"%s\" FROM test_file_modified_time", FILE_MODIFIED_TIME_COLUMN_NAME));
+        Map<Integer, Long> fileModifiedTimeMap = new HashMap<>();
+        for (int i = 0; i < results.getRowCount(); i++) {
+            MaterializedRow row = results.getMaterializedRows().get(i);
+            int col0 = (int) row.getField(0);
+            int col1 = (int) row.getField(1);
+            long fileModifiedTime = (Long) row.getField(2);
+
+            assertTrue(fileModifiedTime > (testStartTime - 2_000));
+            assertEquals(col0 % 3, col1);
+            if (fileModifiedTimeMap.containsKey(col1)) {
+                assertEquals(fileModifiedTimeMap.get(col1).longValue(), fileModifiedTime);
+            }
+            else {
+                fileModifiedTimeMap.put(col1, fileModifiedTime);
+            }
+        }
+        assertEquals(fileModifiedTimeMap.size(), 3);
+
+        assertUpdate("DROP TABLE test_file_modified_time");
     }
 
     @Test
@@ -3192,7 +3324,7 @@ public class TestHiveIntegrationSmokeTest
                     "  test_mismatch_bucketingN\n" +
                     "ON key16=keyN";
 
-            assertUpdate(withoutMismatchOptimization, writeToTableWithMoreBuckets, 15000, assertRemoteExchangesCount(4));
+            assertUpdate(withoutMismatchOptimization, writeToTableWithMoreBuckets, 15000, assertRemoteExchangesCount(3));
             assertQuery(withoutMismatchOptimization, "SELECT * FROM test_mismatch_bucketing_out32", "SELECT orderkey, comment, orderkey, comment, orderkey, comment from orders");
             assertUpdate(withoutMismatchOptimization, "DROP TABLE IF EXISTS test_mismatch_bucketing_out32");
 
@@ -3211,11 +3343,19 @@ public class TestHiveIntegrationSmokeTest
         }
     }
 
+    private Session noReorderJoins(Session session)
+    {
+        return Session.builder(session)
+                .setSystemProperty(JOIN_REORDERING_STRATEGY, ELIMINATE_CROSS_JOINS.name())
+                .setSystemProperty(JOIN_DISTRIBUTION_TYPE, PARTITIONED.name())
+                .build();
+    }
+
     @Test
     public void testPartialMergePushdown()
     {
-        testPartialMergePushdown(getSession());
-        testPartialMergePushdown(materializeExchangesSession);
+        testPartialMergePushdown(noReorderJoins(getSession()));
+        testPartialMergePushdown(noReorderJoins(materializeExchangesSession));
     }
 
     public void testPartialMergePushdown(Session session)
@@ -5295,6 +5435,37 @@ public class TestHiveIntegrationSmokeTest
         assertFalse(getQueryRunner().tableExists(session, "test_parquet_table"));
     }
 
+    @Test
+    public void testParquetSelectivePageSourceFails()
+    {
+        assertUpdate("CREATE TABLE test_parquet_filter_pushdoown (a BIGINT, b BOOLEAN) WITH (format = 'parquet')");
+        assertUpdate(getSession(), "INSERT INTO test_parquet_filter_pushdoown VALUES (1, true)", 1);
+
+        Session noPushdownSession = Session.builder(getSession())
+                .setCatalogSessionProperty("hive", "pushdown_filter_enabled", "false")
+                .setCatalogSessionProperty("hive", "parquet_pushdown_filter_enabled", "false")
+                .build();
+        assertQuery(noPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown", "select 1");
+        assertQuery(noPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown WHERE b = true", "select 1");
+        assertQueryReturnsEmptyResult(noPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown WHERE b = false");
+
+        Session filterPushdownSession = Session.builder(getSession())
+                .setCatalogSessionProperty("hive", "pushdown_filter_enabled", "true")
+                .setCatalogSessionProperty("hive", "parquet_pushdown_filter_enabled", "false")
+                .build();
+        assertQuery(filterPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown", "select 1");
+        assertQuery(filterPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown WHERE b = true", "select 1");
+        assertQueryReturnsEmptyResult(filterPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown WHERE b = false");
+
+        Session parquetFilterPushdownSession = Session.builder(getSession())
+                .setCatalogSessionProperty("hive", "pushdown_filter_enabled", "true")
+                .setCatalogSessionProperty("hive", "parquet_pushdown_filter_enabled", "true")
+                .build();
+        assertQueryFails(parquetFilterPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown", "Parquet reader doesn't support filter pushdown yet");
+        assertQueryFails(parquetFilterPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown WHERE b = true", "Parquet reader doesn't support filter pushdown yet");
+        assertQueryFails(parquetFilterPushdownSession, "SELECT a FROM test_parquet_filter_pushdoown WHERE b = false", "Parquet reader doesn't support filter pushdown yet");
+    }
+
     private void testPageFileCompression(String compression)
     {
         Session testSession = Session.builder(getQueryRunner().getDefaultSession())
@@ -5358,6 +5529,8 @@ public class TestHiveIntegrationSmokeTest
     {
         computeActual("CREATE TABLE test_customer_base WITH (partitioned_by = ARRAY['nationkey']) " +
                 "AS SELECT custkey, name, address, nationkey FROM customer LIMIT 10");
+        computeActual("CREATE TABLE test_customer_base_copy WITH (partitioned_by = ARRAY['nationkey']) " +
+                "AS SELECT custkey, name, address, nationkey FROM customer LIMIT 10");
         computeActual("CREATE TABLE test_orders_base WITH (partitioned_by = ARRAY['orderstatus']) " +
                 "AS SELECT orderkey, custkey, totalprice, orderstatus FROM orders LIMIT 10");
 
@@ -5371,9 +5544,9 @@ public class TestHiveIntegrationSmokeTest
         assertQueryFails(
                 "CREATE MATERIALIZED VIEW test_customer_view AS SELECT name FROM test_customer_base",
                 format(
-                ".* Materialized view '%s.%s.test_customer_view' already exists",
-                getSession().getCatalog().get(),
-                getSession().getSchema().get()));
+                        ".* Materialized view '%s.%s.test_customer_view' already exists",
+                        getSession().getCatalog().get(),
+                        getSession().getSchema().get()));
         assertQuerySucceeds("CREATE MATERIALIZED VIEW IF NOT EXISTS test_customer_view AS SELECT name FROM test_customer_base");
 
         // Test partition mapping
@@ -5383,7 +5556,7 @@ public class TestHiveIntegrationSmokeTest
         assertQueryFails(
                 "CREATE MATERIALIZED VIEW test_customer_view_no_direct_partition_mapped WITH (partitioned_by = ARRAY['nationkey']" + retentionDays(30) + ") " +
                         "AS SELECT name, CAST(nationkey AS BIGINT) AS nationkey FROM test_customer_base",
-                format(".*Materialized view %s.test_customer_view_no_direct_partition_mapped must have at least partition to base table partition mapping for all base tables.",
+                format(".*Materialized view %s.test_customer_view_no_direct_partition_mapped must have at least one partition column that exists in.*",
                         getSession().getSchema().get()));
 
         // Test nested
@@ -5398,7 +5571,7 @@ public class TestHiveIntegrationSmokeTest
                 "AS SELECT COUNT(DISTINCT name) AS num, nationkey FROM (SELECT name, nationkey FROM test_customer_base GROUP BY 1, 2) a GROUP BY nationkey");
         assertUpdate("CREATE MATERIALIZED VIEW test_customer_union_view WITH (partitioned_by = ARRAY['nationkey']" + retentionDays(30) + ") " +
                 "AS SELECT name, nationkey FROM ( SELECT name, nationkey FROM test_customer_base WHERE nationkey = 1 UNION ALL " +
-                "SELECT name, nationkey FROM test_customer_base WHERE nationkey = 2)");
+                "SELECT name, nationkey FROM test_customer_base_copy WHERE nationkey = 2)");
         assertUpdate("CREATE MATERIALIZED VIEW test_customer_order_join_view WITH (partitioned_by = ARRAY['orderstatus', 'nationkey']" + retentionDays(30) + ") " +
                 "AS SELECT orders.totalprice, orders.orderstatus, customer.nationkey FROM test_customer_base customer JOIN " +
                 "test_orders_base orders ON orders.custkey = customer.custkey");
@@ -5406,14 +5579,12 @@ public class TestHiveIntegrationSmokeTest
                 "CREATE MATERIALIZED VIEW test_customer_order_join_view_no_base_partition_mapped WITH (partitioned_by = ARRAY['custkey']" + retentionDays(30) + ") " +
                         "AS SELECT orders.totalprice, customer.nationkey, customer.custkey FROM test_customer_base customer JOIN " +
                         "test_orders_base orders ON orders.custkey = customer.custkey",
-                format(".*Materialized view %s.test_customer_order_join_view_no_base_partition_mapped must have at least partition to base table partition " +
-                        "mapping for all base tables.", getSession().getSchema().get()));
+                format(".*Materialized view %s.test_customer_order_join_view_no_base_partition_mapped must have at least one partition column that exists in.*", getSession().getSchema().get()));
         assertQueryFails(
                 "CREATE MATERIALIZED VIEW test_customer_order_join_view_no_base_partition_mapped WITH (partitioned_by = ARRAY['nation_order']" + retentionDays(30) + ") " +
                         "AS SELECT orders.totalprice, CONCAT(CAST(customer.nationkey AS VARCHAR), orders.orderstatus) AS nation_order " +
                         "FROM test_customer_base customer JOIN test_orders_base orders ON orders.custkey = customer.custkey",
-                format(".*Materialized view %s.test_customer_order_join_view_no_base_partition_mapped must have at least partition to base table partition " +
-                        "mapping for all base tables.", getSession().getSchema().get()));
+                format(".*Materialized view %s.test_customer_order_join_view_no_base_partition_mapped must have at least one partition column that exists in.*", getSession().getSchema().get()));
 
         // Clean up
         computeActual("DROP TABLE IF EXISTS test_customer_base");
@@ -5424,15 +5595,15 @@ public class TestHiveIntegrationSmokeTest
     public void testShowCreateOnMaterializedView()
     {
         String createMaterializedViewSql = formatSqlText(format("CREATE MATERIALIZED VIEW %s.%s.test_customer_view_1\n" +
-                "WITH (\n" +
-                "   format = 'ORC'," +
-                "   partitioned_by = ARRAY['nationkey']\n" +
-                retentionDays(15) +
-                ") AS SELECT\n" +
-                "  name\n" +
-                ", nationkey\n" +
-                "FROM\n" +
-                "  test_customer_base_1",
+                        "WITH (\n" +
+                        "   format = 'ORC'," +
+                        "   partitioned_by = ARRAY['nationkey']\n" +
+                        retentionDays(15) +
+                        ") AS SELECT\n" +
+                        "  name\n" +
+                        ", nationkey\n" +
+                        "FROM\n" +
+                        "  test_customer_base_1",
                 getSession().getCatalog().get(),
                 getSession().getSchema().get()));
 
@@ -5571,6 +5742,17 @@ public class TestHiveIntegrationSmokeTest
                 queryRunner,
                 "SELECT COUNT(*) FROM ( " + expectedInsertQuery + " )",
                 false, true);
+
+        ResultWithQueryId<MaterializedResult> resultWithQueryId = ((DistributedQueryRunner) queryRunner).executeWithQueryId(session, refreshSql);
+        QueryInfo queryInfo = ((DistributedQueryRunner) queryRunner).getQueryInfo(resultWithQueryId.getQueryId());
+        assertEquals(queryInfo.getExpandedQuery().get(),
+                "-- Expanded Query: REFRESH MATERIALIZED VIEW test_orders_view WHERE (ds = '2020-01-01')\n" +
+                        "INSERT INTO test_orders_view SELECT\n" +
+                        "  orderkey\n" +
+                        ", orderpriority\n" +
+                        ", ds\n" +
+                        "FROM\n" +
+                        "  orders_partitioned\n");
     }
 
     @Test

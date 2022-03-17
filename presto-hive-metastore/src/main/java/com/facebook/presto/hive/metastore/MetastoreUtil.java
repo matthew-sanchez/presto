@@ -23,7 +23,9 @@ import com.facebook.presto.common.type.CharType;
 import com.facebook.presto.common.type.DateType;
 import com.facebook.presto.common.type.DecimalType;
 import com.facebook.presto.common.type.Decimals;
+import com.facebook.presto.common.type.DistinctType;
 import com.facebook.presto.common.type.DoubleType;
+import com.facebook.presto.common.type.EnumType;
 import com.facebook.presto.common.type.IntegerType;
 import com.facebook.presto.common.type.MapType;
 import com.facebook.presto.common.type.RealType;
@@ -33,13 +35,16 @@ import com.facebook.presto.common.type.StandardTypes;
 import com.facebook.presto.common.type.TimestampType;
 import com.facebook.presto.common.type.TinyintType;
 import com.facebook.presto.common.type.Type;
+import com.facebook.presto.common.type.TypeWithName;
 import com.facebook.presto.common.type.VarbinaryType;
 import com.facebook.presto.common.type.VarcharType;
 import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
 import com.facebook.presto.hive.HiveBasicStatistics;
+import com.facebook.presto.hive.HiveType;
 import com.facebook.presto.hive.PartitionOfflineException;
 import com.facebook.presto.hive.TableOfflineException;
+import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.ErrorCodeSupplier;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
@@ -131,12 +136,15 @@ import static org.joda.time.DateTimeZone.UTC;
 
 public class MetastoreUtil
 {
+    public static final String METASTORE_HEADERS = "metastore_headers";
     public static final String PRESTO_OFFLINE = "presto_offline";
     public static final String AVRO_SCHEMA_URL_KEY = "avro.schema.url";
     public static final String PRESTO_VIEW_FLAG = "presto_view";
     public static final String PRESTO_MATERIALIZED_VIEW_FLAG = "presto_materialized_view";
     public static final String PRESTO_QUERY_ID_NAME = "presto_query_id";
     public static final String HIVE_DEFAULT_DYNAMIC_PARTITION = "__HIVE_DEFAULT_PARTITION__";
+    public static final String USER_DEFINED_TYPE_ENCODING_ENABLED = "user_defined_type_encoding";
+
     @SuppressWarnings("OctalInteger")
     public static final FsPermission ALL_PERMISSIONS = new FsPermission((short) 0777);
 
@@ -145,7 +153,13 @@ public class MetastoreUtil
     private static final String NUM_ROWS = "numRows";
     private static final String RAW_DATA_SIZE = "rawDataSize";
     private static final String TOTAL_SIZE = "totalSize";
-    private static final Set<String> STATS_PROPERTIES = ImmutableSet.of(NUM_FILES, NUM_ROWS, RAW_DATA_SIZE, TOTAL_SIZE);
+    // transient_lastDdlTime is the parameter recording the latest ddl time.
+    // It should be added in STATS_PROPERTIES so that it can be skipped when
+    // updating StatisticsParameters, which allows hive find this dismiss
+    // parameter and create a new transient_lastDdlTime with present time
+    // rather than copying the old transient_lastDdlTime to hive partition.
+    private static final String TRANSIENT_LAST_DDL_TIME = "transient_lastDdlTime";
+    private static final Set<String> STATS_PROPERTIES = ImmutableSet.of(NUM_FILES, NUM_ROWS, RAW_DATA_SIZE, TOTAL_SIZE, TRANSIENT_LAST_DDL_TIME);
 
     private MetastoreUtil()
     {
@@ -183,7 +197,8 @@ public class MetastoreUtil
                 table.getParameters(),
                 table.getDatabaseName(),
                 table.getTableName(),
-                table.getPartitionColumns());
+                table.getPartitionColumns().stream().map(column -> column.getName()).collect(toList()),
+                table.getPartitionColumns().stream().map(column -> column.getType()).collect(toList()));
     }
 
     public static Properties getHiveSchema(Partition partition, Table table)
@@ -196,7 +211,8 @@ public class MetastoreUtil
                 table.getParameters(),
                 table.getDatabaseName(),
                 table.getTableName(),
-                table.getPartitionColumns());
+                table.getPartitionColumns().stream().map(column -> column.getName()).collect(toList()),
+                table.getPartitionColumns().stream().map(column -> column.getType()).collect(toList()));
     }
 
     public static Properties getHiveSchema(
@@ -206,7 +222,8 @@ public class MetastoreUtil
             Map<String, String> tableParameters,
             String databaseName,
             String tableName,
-            List<Column> partitionKeys)
+            List<String> partitionKeyNames,
+            List<HiveType> partitionKeyTypes)
     {
         // Mimics function in Hive:
         // MetaStoreUtils.getSchema(StorageDescriptor, StorageDescriptor, Map<String, String>, String, String, List<FieldSchema>)
@@ -262,16 +279,21 @@ public class MetastoreUtil
         String partStringSep = "";
         String partTypesString = "";
         String partTypesStringSep = "";
-        for (Column partKey : partitionKeys) {
+
+        for (int index = 0; index < partitionKeyNames.size(); ++index) {
+            String name = partitionKeyNames.get(index);
+            HiveType type = partitionKeyTypes.get(index);
+
             partString += partStringSep;
-            partString += partKey.getName();
+            partString += name;
             partTypesString += partTypesStringSep;
-            partTypesString += partKey.getType().getHiveTypeName().toString();
+            partTypesString += type.getHiveTypeName().toString();
             if (partStringSep.length() == 0) {
                 partStringSep = "/";
                 partTypesStringSep = ":";
             }
         }
+
         if (partString.length() > 0) {
             schema.setProperty(META_TABLE_PARTITION_COLUMNS, partString);
             schema.setProperty(META_TABLE_PARTITION_COLUMN_TYPES, partTypesString);
@@ -854,6 +876,16 @@ public class MetastoreUtil
         if (type instanceof ArrayType || type instanceof RowType || type instanceof MapType) {
             return ImmutableSet.of(NUMBER_OF_NON_NULL_VALUES, TOTAL_SIZE_IN_BYTES);
         }
+        if (type instanceof TypeWithName) {
+            return getSupportedColumnStatistics(((TypeWithName) type).getType());
+        }
+        if (type instanceof DistinctType) {
+            return getSupportedColumnStatistics(((DistinctType) type).getBaseType());
+        }
+        if (type instanceof EnumType) {
+            return getSupportedColumnStatistics(((EnumType) type).getValueType());
+        }
+
         // Throwing here to make sure this method is updated when a new type is added in Hive connector
         throw new IllegalArgumentException("Unsupported type: " + type);
     }
@@ -895,5 +927,25 @@ public class MetastoreUtil
         statistics.getOnDiskDataSizeInBytes().ifPresent(size -> result.put(TOTAL_SIZE, Long.toString(size)));
 
         return result.build();
+    }
+
+    public static Optional<String> getMetastoreHeaders(ConnectorSession session)
+    {
+        try {
+            return Optional.ofNullable(session.getProperty(METASTORE_HEADERS, String.class));
+        }
+        catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
+    public static boolean isUserDefinedTypeEncodingEnabled(ConnectorSession session)
+    {
+        try {
+            return session.getProperty(USER_DEFINED_TYPE_ENCODING_ENABLED, Boolean.class);
+        }
+        catch (Exception e) {
+            return false;
+        }
     }
 }

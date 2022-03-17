@@ -33,7 +33,6 @@ import com.facebook.presto.hive.metastore.Storage;
 import com.facebook.presto.hive.metastore.Table;
 import com.facebook.presto.hive.pagefile.PageInputFormat;
 import com.facebook.presto.hive.util.FooterAwareRecordReader;
-import com.facebook.presto.hive.util.HudiRealtimeSplitConverter;
 import com.facebook.presto.orc.metadata.OrcType;
 import com.facebook.presto.spi.ColumnMetadata;
 import com.facebook.presto.spi.PrestoException;
@@ -76,6 +75,9 @@ import org.apache.hadoop.mapred.RecordReader;
 import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.mapred.TextInputFormat;
 import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.hadoop.HoodieParquetInputFormat;
+import org.apache.hudi.hadoop.realtime.HoodieParquetRealtimeInputFormat;
 import org.apache.hudi.hadoop.realtime.HoodieRealtimeFileSplit;
 import org.joda.time.DateTimeZone;
 import org.joda.time.format.DateTimeFormat;
@@ -123,12 +125,17 @@ import static com.facebook.presto.common.type.RealType.REAL;
 import static com.facebook.presto.common.type.SmallintType.SMALLINT;
 import static com.facebook.presto.common.type.TimestampType.TIMESTAMP;
 import static com.facebook.presto.common.type.TinyintType.TINYINT;
+import static com.facebook.presto.common.type.TypeUtils.isEnumType;
 import static com.facebook.presto.common.type.Varchars.isVarcharType;
 import static com.facebook.presto.hive.HiveColumnHandle.ColumnType.PARTITION_KEY;
 import static com.facebook.presto.hive.HiveColumnHandle.ColumnType.REGULAR;
 import static com.facebook.presto.hive.HiveColumnHandle.MAX_PARTITION_KEY_COLUMN_INDEX;
 import static com.facebook.presto.hive.HiveColumnHandle.bucketColumnHandle;
+import static com.facebook.presto.hive.HiveColumnHandle.fileModifiedTimeColumnHandle;
+import static com.facebook.presto.hive.HiveColumnHandle.fileSizeColumnHandle;
 import static com.facebook.presto.hive.HiveColumnHandle.isBucketColumnHandle;
+import static com.facebook.presto.hive.HiveColumnHandle.isFileModifiedTimeColumnHandle;
+import static com.facebook.presto.hive.HiveColumnHandle.isFileSizeColumnHandle;
 import static com.facebook.presto.hive.HiveColumnHandle.isPathColumnHandle;
 import static com.facebook.presto.hive.HiveColumnHandle.pathColumnHandle;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_BAD_DATA;
@@ -176,6 +183,7 @@ import static org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector.Cate
 
 public final class HiveUtil
 {
+    public static final String CUSTOM_FILE_SPLIT_CLASS_KEY = "custom_split_class";
     private static final Pattern DEFAULT_HIVE_COLUMN_NAME_PATTERN = Pattern.compile("_col\\d+");
 
     private static final String VIEW_PREFIX = "/* Presto View: ";
@@ -192,6 +200,8 @@ public final class HiveUtil
     private static final int DECIMAL_SCALE_GROUP = 2;
 
     private static final String BIG_DECIMAL_POSTFIX = "BD";
+    private static final String USE_RECORD_READER_FROM_INPUT_FORMAT_ANNOTATION = "UseRecordReaderFromInputFormat";
+    private static final String USE_FILE_SPLITS_FROM_INPUT_FORMAT_ANNOTATION = "UseFileSplitsFromInputFormat";
 
     static {
         DateTimeParser[] timestampWithoutTimeZoneParser = {
@@ -291,7 +301,7 @@ public final class HiveUtil
 
     private static boolean isHudiRealtimeSplit(Map<String, String> customSplitInfo)
     {
-        String customSplitClass = customSplitInfo.get(HudiRealtimeSplitConverter.CUSTOM_SPLIT_CLASS_KEY);
+        String customSplitClass = customSplitInfo.get(CUSTOM_FILE_SPLIT_CLASS_KEY);
         return HoodieRealtimeFileSplit.class.getName().equals(customSplitClass);
     }
 
@@ -362,13 +372,46 @@ public final class HiveUtil
         return name;
     }
 
-    public static boolean shouldUseRecordReaderFromInputFormat(Configuration configuration, Storage storage)
+    static boolean shouldUseRecordReaderFromInputFormat(Configuration configuration, Storage storage, Map<String, String> customSplitInfo)
     {
+        if (customSplitInfo == null || !customSplitInfo.containsKey(CUSTOM_FILE_SPLIT_CLASS_KEY)) {
+            return false;
+        }
+
         InputFormat<?, ?> inputFormat = HiveUtil.getInputFormat(configuration, storage.getStorageFormat().getInputFormat(), false);
         return Arrays.stream(inputFormat.getClass().getAnnotations())
                 .map(Annotation::annotationType)
                 .map(Class::getSimpleName)
-                .anyMatch(name -> name.equals("UseRecordReaderFromInputFormat"));
+                .anyMatch(USE_RECORD_READER_FROM_INPUT_FORMAT_ANNOTATION::equals);
+    }
+
+    static boolean shouldUseFileSplitsFromInputFormat(InputFormat<?, ?> inputFormat, DirectoryLister directoryLister)
+    {
+        if (directoryLister instanceof HudiDirectoryLister) {
+            boolean hasUseSplitsAnnotation = Arrays.stream(inputFormat.getClass().getAnnotations())
+                    .map(Annotation::annotationType)
+                    .map(Class::getSimpleName)
+                    .anyMatch(USE_FILE_SPLITS_FROM_INPUT_FORMAT_ANNOTATION::equals);
+
+            return hasUseSplitsAnnotation &&
+                    (!isHudiParquetInputFormat(inputFormat) || shouldUseFileSplitsForHudi(inputFormat, ((HudiDirectoryLister) directoryLister).getMetaClient()));
+        }
+
+        return false;
+    }
+
+    static boolean isHudiParquetInputFormat(InputFormat<?, ?> inputFormat)
+    {
+        return inputFormat instanceof HoodieParquetInputFormat;
+    }
+
+    private static boolean shouldUseFileSplitsForHudi(InputFormat<?, ?> inputFormat, HoodieTableMetaClient metaClient)
+    {
+        if (inputFormat instanceof HoodieParquetRealtimeInputFormat) {
+            return true;
+        }
+
+        return metaClient.getTableConfig().getBootstrapBasePath().isPresent();
     }
 
     public static long parseHiveDate(String value)
@@ -529,7 +572,8 @@ public final class HiveUtil
                 DATE.equals(type) ||
                 TIMESTAMP.equals(type) ||
                 isVarcharType(type) ||
-                isCharType(type);
+                isCharType(type) ||
+                isEnumType(type);
     }
 
     public static NullableValue parsePartitionValue(HivePartitionKey key, Type type, DateTimeZone timeZone)
@@ -880,6 +924,8 @@ public final class HiveUtil
         if (table.getStorage().getBucketProperty().isPresent()) {
             columns.add(bucketColumnHandle());
         }
+        columns.add(fileSizeColumnHandle());
+        columns.add(fileModifiedTimeColumnHandle());
 
         return columns.build();
     }
@@ -924,7 +970,7 @@ public final class HiveUtil
         return partitionKey ? "partition key" : null;
     }
 
-    public static Optional<String> getPrefilledColumnValue(HiveColumnHandle columnHandle, HivePartitionKey partitionKey, Path path, OptionalInt bucketNumber)
+    public static Optional<String> getPrefilledColumnValue(HiveColumnHandle columnHandle, HivePartitionKey partitionKey, Path path, OptionalInt bucketNumber, long fileSize, long fileModifiedTime)
     {
         if (partitionKey != null) {
             return partitionKey.getValue();
@@ -938,6 +984,13 @@ public final class HiveUtil
             }
             return Optional.of(String.valueOf(bucketNumber.getAsInt()));
         }
+        if (isFileSizeColumnHandle(columnHandle)) {
+            return Optional.of(String.valueOf(fileSize));
+        }
+        if (isFileModifiedTimeColumnHandle(columnHandle)) {
+            return Optional.of(String.valueOf(fileModifiedTime));
+        }
+
         throw new PrestoException(NOT_SUPPORTED, "unsupported hidden column: " + columnHandle);
     }
 
@@ -1061,7 +1114,7 @@ public final class HiveUtil
             Integer physicalOrdinal = physicalNameOrdinalMap.get(column.getName());
             if (physicalOrdinal == null) {
                 // if the column is missing from the file, assign it a column number larger than the number of columns in the
-                // file so the reader will fill it with nulls.  If the index is negative, i.e. this is a sythesized column like
+                // file so the reader will fill it with nulls.  If the index is negative, i.e. this is a synthesized column like
                 // a partitioning key, $bucket or $path, leave it as is.
                 if (column.getHiveColumnIndex() < 0) {
                     physicalOrdinal = column.getHiveColumnIndex();

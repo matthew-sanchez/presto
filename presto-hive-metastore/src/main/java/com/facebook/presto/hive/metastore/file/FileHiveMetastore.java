@@ -28,6 +28,7 @@ import com.facebook.presto.hive.metastore.Database;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.HiveColumnStatistics;
 import com.facebook.presto.hive.metastore.HivePrivilegeInfo;
+import com.facebook.presto.hive.metastore.HiveTableName;
 import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.hive.metastore.MetastoreUtil;
 import com.facebook.presto.hive.metastore.Partition;
@@ -45,10 +46,13 @@ import com.facebook.presto.spi.security.ConnectorIdentity;
 import com.facebook.presto.spi.security.PrestoPrincipal;
 import com.facebook.presto.spi.security.RoleGrant;
 import com.facebook.presto.spi.statistics.ColumnStatisticType;
+import com.google.common.collect.BiMap;
+import com.google.common.collect.HashBiMap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.io.ByteStreams;
+import io.airlift.units.Duration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -57,6 +61,7 @@ import org.apache.hadoop.fs.Path;
 import javax.annotation.concurrent.ThreadSafe;
 import javax.inject.Inject;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayDeque;
@@ -79,6 +84,7 @@ import java.util.function.Function;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_METASTORE_ERROR;
 import static com.facebook.presto.hive.HiveErrorCode.HIVE_PARTITION_DROPPED_DURING_QUERY;
 import static com.facebook.presto.hive.metastore.HivePrivilegeInfo.HivePrivilege.OWNERSHIP;
+import static com.facebook.presto.hive.metastore.HiveTableName.hiveTableName;
 import static com.facebook.presto.hive.metastore.MetastoreUtil.convertPredicateToParts;
 import static com.facebook.presto.hive.metastore.MetastoreUtil.extractPartitionValues;
 import static com.facebook.presto.hive.metastore.MetastoreUtil.getHiveBasicStatistics;
@@ -120,6 +126,9 @@ public class FileHiveMetastore
     private final Path catalogDirectory;
     private final HdfsContext hdfsContext;
     private final FileSystem metadataFileSystem;
+
+    private final BiMap<Long, HiveTableName> lockedHiveTables = HashBiMap.create();
+    private long currentLockId;
 
     private final JsonCodec<DatabaseMetadata> databaseCodec = JsonCodec.jsonCodec(DatabaseMetadata.class);
     private final JsonCodec<TableMetadata> tableCodec = JsonCodec.jsonCodec(TableMetadata.class);
@@ -261,6 +270,12 @@ public class FileHiveMetastore
         }
         else {
             throw new PrestoException(NOT_SUPPORTED, "Table type not supported: " + table.getTableType());
+        }
+
+        if (!table.getTableType().equals(VIRTUAL_VIEW)) {
+            File location = new File(new Path(table.getStorage().getLocation()).toUri());
+            checkArgument(location.isDirectory(), "Table location is not a directory: %s", location);
+            checkArgument(location.exists(), "Table directory does not exist: %s", location);
         }
 
         writeSchemaFile("table", tableMetadataDirectory, tableCodec, new TableMetadata(table), false);
@@ -495,7 +510,7 @@ public class FileHiveMetastore
 
             return oldTable.withDataColumns(ImmutableList.<Column>builder()
                     .addAll(oldTable.getDataColumns())
-                    .add(new Column(columnName, columnType, Optional.ofNullable(columnComment)))
+                    .add(new Column(columnName, columnType, Optional.ofNullable(columnComment), Optional.empty()))
                     .build());
         });
     }
@@ -520,7 +535,7 @@ public class FileHiveMetastore
             ImmutableList.Builder<Column> newDataColumns = ImmutableList.builder();
             for (Column fieldSchema : oldTable.getDataColumns()) {
                 if (fieldSchema.getName().equals(oldColumnName)) {
-                    newDataColumns.add(new Column(newColumnName, fieldSchema.getType(), fieldSchema.getComment()));
+                    newDataColumns.add(new Column(newColumnName, fieldSchema.getType(), fieldSchema.getComment(), fieldSchema.getTypeMetadata()));
                 }
                 else {
                     newDataColumns.add(fieldSchema);
@@ -918,8 +933,8 @@ public class FileHiveMetastore
         List<String> parts = convertPredicateToParts(partitionPredicates);
         // todo this should be more efficient by selectively walking the directory tree
         return getPartitionNames(metastoreContext, databaseName, tableName).map(partitionNames -> partitionNames.stream()
-                .filter(partitionName -> partitionMatches(partitionName, parts))
-                .collect(toImmutableList()))
+                        .filter(partitionName -> partitionMatches(partitionName, parts))
+                        .collect(toImmutableList()))
                 .orElse(ImmutableList.of());
     }
 
@@ -969,7 +984,7 @@ public class FileHiveMetastore
         }
         Path permissionFilePath = getPermissionsPath(getPermissionsDirectory(table), principal);
         result.addAll(readFile("permissions", permissionFilePath, permissionsCodec).orElse(ImmutableList.of()).stream()
-                .map(PermissionMetadata::toHivePrivilegeInfo)
+                .map(permissionMetadata -> permissionMetadata.toHivePrivilegeInfo(principal.getName()))
                 .collect(toSet()));
         return result.build();
     }
@@ -984,9 +999,41 @@ public class FileHiveMetastore
     public synchronized void revokeTablePrivileges(MetastoreContext metastoreContext, String databaseName, String tableName, PrestoPrincipal grantee, Set<HivePrivilegeInfo> privileges)
     {
         Set<HivePrivilegeInfo> currentPrivileges = listTablePrivileges(metastoreContext, databaseName, tableName, grantee);
-        currentPrivileges.removeAll(privileges);
 
-        setTablePrivileges(metastoreContext, grantee, databaseName, tableName, currentPrivileges);
+        //create mutable list to operate on collection
+        Set<HivePrivilegeInfo> updatedPrivileges = currentPrivileges.stream().filter(currentPrivilege -> !privileges.contains(currentPrivilege)).collect(toSet());
+
+        setTablePrivileges(metastoreContext, grantee, databaseName, tableName, updatedPrivileges);
+    }
+
+    @Override
+    public synchronized void setPartitionLeases(MetastoreContext metastoreContext, String databaseName, String tableName, Map<String, String> partitionNameToLocation, Duration leaseDuration)
+    {
+        throw new UnsupportedOperationException("setPartitionLeases is not supported in FileHiveMetastore");
+    }
+
+    @Override
+    public synchronized long lock(MetastoreContext metastoreContext, String databaseName, String tableName)
+    {
+        HiveTableName hiveTableName = hiveTableName(databaseName, tableName);
+        while (lockedHiveTables.containsValue(hiveTableName)) {
+            try {
+                Thread.sleep(10);
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Waiting for lock interrupted");
+            }
+        }
+        long lockId = ++currentLockId;
+        lockedHiveTables.put(lockId, hiveTableName);
+        return lockId;
+    }
+
+    @Override
+    public synchronized void unlock(MetastoreContext metastoreContext, long lockId)
+    {
+        lockedHiveTables.remove(lockId);
     }
 
     private synchronized void setTablePrivileges(

@@ -17,6 +17,7 @@ import com.facebook.presto.common.predicate.TupleDomain;
 import com.facebook.presto.common.type.TypeManager;
 import com.facebook.presto.hive.HdfsContext;
 import com.facebook.presto.hive.HdfsEnvironment;
+import com.facebook.presto.hive.HiveColumnConverterProvider;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.hive.metastore.MetastoreContext;
 import com.facebook.presto.spi.ConnectorSession;
@@ -29,10 +30,12 @@ import org.apache.iceberg.HistoryEntry;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.io.LocationProvider;
 
 import java.util.List;
 import java.util.Locale;
@@ -43,16 +46,20 @@ import java.util.regex.Pattern;
 import static com.facebook.presto.hive.HiveMetadata.TABLE_COMMENT;
 import static com.facebook.presto.iceberg.IcebergErrorCode.ICEBERG_INVALID_SNAPSHOT_ID;
 import static com.facebook.presto.iceberg.TypeConverter.toPrestoType;
+import static com.facebook.presto.iceberg.util.IcebergPrestoModelConverters.toIcebergTableIdentifier;
+import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.Lists.reverse;
 import static com.google.common.collect.Streams.stream;
 import static java.lang.String.format;
 import static org.apache.iceberg.BaseMetastoreTableOperations.ICEBERG_TABLE_TYPE_VALUE;
 import static org.apache.iceberg.BaseMetastoreTableOperations.TABLE_TYPE_PROP;
+import static org.apache.iceberg.LocationProviders.locationsFor;
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT;
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT_DEFAULT;
+import static org.apache.iceberg.TableProperties.WRITE_LOCATION_PROVIDER_IMPL;
 
-final class IcebergUtil
+public final class IcebergUtil
 {
     private static final Pattern SIMPLE_NAME = Pattern.compile("[a-z][a-z0-9]*");
 
@@ -63,17 +70,22 @@ final class IcebergUtil
         return ICEBERG_TABLE_TYPE_VALUE.equalsIgnoreCase(table.getParameters().get(TABLE_TYPE_PROP));
     }
 
-    public static Table getIcebergTable(ExtendedHiveMetastore metastore, HdfsEnvironment hdfsEnvironment, ConnectorSession session, SchemaTableName table)
+    public static Table getHiveIcebergTable(ExtendedHiveMetastore metastore, HdfsEnvironment hdfsEnvironment, ConnectorSession session, SchemaTableName table)
     {
         HdfsContext hdfsContext = new HdfsContext(session, table.getSchemaName(), table.getTableName());
         TableOperations operations = new HiveTableOperations(
                 metastore,
-                new MetastoreContext(session.getIdentity(), session.getQueryId(), session.getClientInfo(), session.getSource()),
+                new MetastoreContext(session.getIdentity(), session.getQueryId(), session.getClientInfo(), session.getSource(), Optional.empty(), false, HiveColumnConverterProvider.DEFAULT_COLUMN_CONVERTER_PROVIDER),
                 hdfsEnvironment,
                 hdfsContext,
                 table.getSchemaName(),
                 table.getTableName());
         return new BaseTable(operations, quotedTableName(table));
+    }
+
+    public static Table getHadoopIcebergTable(IcebergResourceFactory resourceFactory, ConnectorSession session, SchemaTableName table)
+    {
+        return resourceFactory.getCatalog(session).loadTable(toIcebergTableIdentifier(table));
     }
 
     public static long resolveSnapshotId(Table table, long snapshotId)
@@ -87,6 +99,17 @@ final class IcebergUtil
                 .map(HistoryEntry::snapshotId)
                 .findFirst()
                 .orElseThrow(() -> new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID, format("Invalid snapshot [%s] for table: %s", snapshotId, table)));
+    }
+
+    public static Optional<Long> resolveSnapshotIdByName(Table table, IcebergTableName name)
+    {
+        if (name.getSnapshotId().isPresent()) {
+            if (table.snapshot(name.getSnapshotId().get()) == null) {
+                throw new PrestoException(ICEBERG_INVALID_SNAPSHOT_ID, format("Invalid snapshot [%s] for table: %s", name.getSnapshotId().get(), table));
+            }
+            return name.getSnapshotId();
+        }
+        return Optional.ofNullable(table.currentSnapshot()).map(Snapshot::snapshotId);
     }
 
     public static List<IcebergColumnHandle> getColumns(Schema schema, TypeManager typeManager)
@@ -111,14 +134,6 @@ final class IcebergUtil
             }
         }
         return columns.build();
-    }
-
-    public static String getDataPath(String location)
-    {
-        if (!location.endsWith("/")) {
-            location += "/";
-        }
-        return location + "data";
     }
 
     public static FileFormat getFileFormat(Table table)
@@ -159,5 +174,14 @@ final class IcebergUtil
     {
         return stream(icebergTable.snapshots())
                 .anyMatch(snapshot -> snapshot.snapshotId() == id);
+    }
+
+    public static LocationProvider getLocationProvider(SchemaTableName schemaTableName, String tableLocation, Map<String, String> storageProperties)
+    {
+        if (storageProperties.containsKey(WRITE_LOCATION_PROVIDER_IMPL)) {
+            throw new PrestoException(NOT_SUPPORTED, "Table " + schemaTableName + " specifies " + storageProperties.get(WRITE_LOCATION_PROVIDER_IMPL) +
+                    " as a location provider. Writing to Iceberg tables with custom location provider is not supported.");
+        }
+        return locationsFor(tableLocation, storageProperties);
     }
 }

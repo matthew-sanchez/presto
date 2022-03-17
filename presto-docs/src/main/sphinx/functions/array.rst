@@ -44,7 +44,7 @@ Array Functions
 
     Remove duplicate values from the array ``x``.
 
-.. function:: array_dupes(array(T)) -> array(bigint/varchar)
+.. function:: array_duplicates(array(T)) -> array(bigint/varchar)
 
     Returns a set of elements that occur more than once in ``array``.
 
@@ -64,7 +64,7 @@ Array Functions
     Returns a map: keys are the unique elements in the ``array``, values are how many times the key appears.
     Ignores null elements. Empty array returns empty map.
 
-.. function:: array_has_dupes(array(T)) -> boolean
+.. function:: array_has_duplicates(array(T)) -> boolean
 
     Returns a boolean: whether ``array`` has any elements that occur more than once.
 
@@ -285,6 +285,16 @@ Array Functions
 
     Subsets array ``x`` starting from index ``start`` (or starting from the end
     if ``start`` is negative) with a length of ``length``.
+
+.. function:: trim_array(x, n) -> array
+
+    Remove ``n`` elements from the end of array::
+
+        SELECT trim_array(ARRAY[1, 2, 3, 4], 1);
+        -- [1, 2, 3]
+
+        SELECT trim_array(ARRAY[1, 2, 3, 4], 2);
+        -- [1, 2]
 
 .. function:: transform(array(T), function(T,U)) -> array(U)
 
