@@ -11,6 +11,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package com.facebook.presto.dynamicCatalog;
 
 import com.facebook.airlift.discovery.client.Announcer;
@@ -21,8 +22,13 @@ import com.facebook.presto.metadata.CatalogManager;
 import com.facebook.presto.metadata.InternalNodeManager;
 import com.facebook.presto.metadata.StaticCatalogStoreConfig;
 import com.facebook.presto.spi.ConnectorId;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Joiner;
 import com.google.common.base.Splitter;
+import org.codehaus.plexus.util.FileUtils;
+import org.postgresql.Driver;
+import org.postgresql.PGNotification;
 
 import javax.inject.Inject;
 import javax.ws.rs.Consumes;
@@ -36,15 +42,27 @@ import javax.ws.rs.core.Response;
 
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.OutputStream;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.LongSummaryStatistics;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 
 import static com.facebook.airlift.discovery.client.ServiceAnnouncement.serviceAnnouncement;
 import static com.google.common.base.Strings.nullToEmpty;
+
+/*
+import org.codehaus.plexus.util.FileUtils;
+import org.postgresql.Driver;
+import org.postgresql.PGNotification;
+ */
+
 
 @Path("/v1/catalog")
 public class DynamicCatalogController
@@ -56,6 +74,7 @@ public class DynamicCatalogController
     private final File catalogConfigurationDir;
     private static final Logger log = Logger.get(DynamicCatalogController.class);
     private final ResponseParser responseParser;
+    private Listener listener;
 
     private DynamicCatalogController(CatalogManager catalogManager, ConnectorManager connectorManager, Announcer announcer, InternalNodeManager internalNodeManager, File catalogConfigurationDir, ResponseParser responseParser)
     {
@@ -63,8 +82,30 @@ public class DynamicCatalogController
         this.connectorManager = connectorManager;
         this.announcer = announcer;
         this.internalNodeManager = internalNodeManager;
-        this.catalogConfigurationDir = catalogConfigurationDir;
         this.responseParser = responseParser;
+        // clean catalogConfigurationDir upon start
+        // this is called before catalogs can even be loaded into memory
+        // (so this is sufficient to handle pre-existing catalogs on startup)
+        this.catalogConfigurationDir = catalogConfigurationDir;
+        try {
+            FileUtils.cleanDirectory(this.catalogConfigurationDir);
+            System.out.println("cleaned catalog dir");
+        }
+        catch (IOException ioe) {
+            System.out.println("ERROR Unable to clean catalog dir");
+        }
+
+        // init listener, listener's constructor will query db and update catalog dir
+        try {
+            this.listener = new Listener("jdbc:postgresql://db.sece.io/geonaming?" +
+                    "user=geo_api" +
+                    "&password=g3QMmAsv" +
+                    "&sslmode=require", this);
+            this.listener.start();
+        }
+        catch (SQLException sqle) {
+            sqle.printStackTrace();
+        }
     }
 
     @Inject
@@ -108,7 +149,7 @@ public class DynamicCatalogController
             responseMessage = deletePropertyFile(catalogName) ? "Successfully deleted" : "Error deleting catalog";
         }
         else {
-            log.info("deleteCatalog() : Catalog doesn't exists, Can't be deleted " + catalogName);
+            log.info("deleteCatalog() : Catalog doesn't exist, Can't be deleted " + catalogName);
             return failedResponse(responseParser.build("Catalog doesn't exists: " + catalogName, 500));
         }
         log.info("deleteCatalog() : successfully deleted catalog " + catalogName);
@@ -175,5 +216,170 @@ public class DynamicCatalogController
     private Response failedResponse(ResponseParser responseParser)
     {
         return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity(responseParser).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    class Listener
+            extends Thread
+    {
+        private final java.sql.Connection conn;
+        private final org.postgresql.PGConnection pgconn;
+        private final Driver driver = new Driver();
+        private final String channel = "nodes";
+        private final ObjectMapper mapper;
+        private final DynamicCatalogController controller;
+        private LongSummaryStatistics stats;
+        private boolean synced;
+
+        Listener(String connectionString, DynamicCatalogController controller) throws SQLException
+        {
+            this.controller = controller;
+            this.conn = this.driver.connect(connectionString, new Properties());
+            this.pgconn = this.conn.unwrap(org.postgresql.PGConnection.class);
+            this.mapper = new ObjectMapper();
+            this.stats = new LongSummaryStatistics();
+            this.synced = false;
+            java.sql.Statement stmt = this.conn.createStatement();
+            int setuid = stmt.executeUpdate("set session.uid='R2wzx2ovqEeBSjcRxgPZ9ZNT2j33';");
+            System.out.println(setuid);
+            stmt.execute("LISTEN " + this.channel);
+            stmt.close();
+            System.out.println("Listener initiated on channel: " + this.channel);
+        }
+
+        public void run()
+        {
+            try {
+                while (true) {
+                    System.out.println("Listener loop");
+                    if (!this.synced) {
+                        java.sql.Statement stmt = this.conn.createStatement();
+                        ResultSet rs = stmt.executeQuery("SELECT id, url from nodes");
+                        int catalogCount = 0;
+
+                        long start = System.currentTimeMillis();
+                        while (rs.next()) {
+                            if (insertCatalog(rs.getString(1), rs.getString(2))) {
+                                catalogCount++;
+                            }
+                        }
+                        long end = System.currentTimeMillis();
+                        this.stats.accept(end - start);
+
+                        if (catalogCount > 0) {
+                            System.out.println("added " + catalogCount + " catalogs on sync with localdb");
+                            this.synced = true;
+                        }
+                        else {
+                            System.out.println("no updates on sync with localdb");
+                        }
+                        System.out.println("time to sync: " + (end - start));
+
+                        stmt.close();
+                        rs.close();
+                    }
+                    org.postgresql.PGNotification[] notifications = pgconn.getNotifications(45000);
+                    // If this thread is the only one that uses the connection, a timeout can be used to
+                    // receive notifications immediately:
+                    // org.postgresql.PGNotification notifications[] = pgconn.getNotifications(10000);
+
+                    if (notifications != null) {
+                        for (int i = 0; i < notifications.length; i++) {
+                            this.processNotification(notifications[i]);
+                            //{"action" : "insert", "id" : "aaa", "url" : "blah",
+                            // "service_region" : {"type": "Polygon", "coordinates": [[[-71.177658505, 42.390290974], [-71.177682027, 42.390370174], [-71.177606301, 42.390382566], [-71.177582658, 42.390303365], [-71.177658505, 42.390290974]]]}}
+                        }
+                        this.synced = true;
+                    }
+                    // wait a while before checking again for new
+                    // notifications
+
+//                Thread.sleep(500);
+                }
+            }
+            catch (SQLException sqle) {
+                sqle.printStackTrace();
+            }
+        }
+
+        private void processNotification(PGNotification n)
+        {
+            System.out.println("Got notification: " + n.getName());
+            System.out.println(n.getParameter());
+            try {
+                Map<String, String> payload = mapper.readValue(n.getParameter(), Map.class);
+                switch (payload.get("action")) {
+                    case "insert":
+                        if (this.insertPayload(payload)) {
+                            System.out.println("insert successful");
+                        }
+                        else {
+                            System.out.println("insert failed");
+                        }
+                        break;
+                    case "delete":
+                        if (this.controller.deleteCatalog(payload.get("id")).getStatus() == 200) {
+                            System.out.println("delete successful");
+                        }
+                        else {
+                            System.out.println("delete failed");
+                        }
+                        break;
+                    case "update":
+                        if (this.insertPayload(payload) &&
+                                (this.controller.deleteCatalog(payload.get("id")).getStatus() == 200)) {
+                            System.out.println("update successful");
+                        }
+                        else {
+                            System.out.println("update failed");
+                        }
+                        break;
+                }
+            }
+            catch (JsonProcessingException jsonParseException) {
+                jsonParseException.printStackTrace();
+            }
+        }
+
+        private void fillProperties(Map<String, String> p, String url)
+        {
+            String[] fields = url.split("\\?");
+            p.put("connection-url", fields[0]);
+            for (int i = 1; i < fields.length; i++) {
+                String[] params = fields[i].split("=");
+                switch (params[0]) {
+                    case "user":
+                        p.put("connection-user", params[1]);
+                        break;
+                    case "password":
+                        p.put("connection-password", params[1]);
+                        break;
+                }
+            }
+        }
+
+        private boolean insertPayload(Map<String, String> payload)
+        {
+            CatalogVo catalog = new CatalogVo();
+            catalog.catalogName = payload.get("id");
+            catalog.connectorName = "postgresql";
+            catalog.properties = new HashMap<String, String>();
+            this.fillProperties(catalog.properties, payload.get("url"));
+            Response r = this.controller.addCatalog(catalog);
+            return r.getStatus() == 200;
+        }
+
+        private boolean insertCatalog(String id, String connectionString)
+        {
+            System.out.println("id: " + id);
+            System.out.println("connectionString: " + connectionString);
+            CatalogVo catalog = new CatalogVo();
+            catalog.catalogName = id;
+            catalog.connectorName = "postgresql";
+            catalog.properties = new HashMap<>();
+            this.fillProperties(catalog.properties, connectionString);
+//        catalog.properties.put("connection-url", connectionString);
+            Response r = this.controller.addCatalog(catalog);
+            return r.getStatus() == 200;
+        }
     }
 }
