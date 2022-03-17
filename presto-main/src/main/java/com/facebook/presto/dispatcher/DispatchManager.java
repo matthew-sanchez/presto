@@ -15,8 +15,13 @@ package com.facebook.presto.dispatcher;
 
 import com.facebook.airlift.concurrent.BoundedExecutor;
 import com.facebook.presto.Session;
-import com.facebook.presto.execution.*;
+import com.facebook.presto.execution.QueryIdGenerator;
+import com.facebook.presto.execution.QueryInfo;
+import com.facebook.presto.execution.QueryManagerConfig;
+import com.facebook.presto.execution.QueryManagerStats;
+import com.facebook.presto.execution.QueryPreparer;
 import com.facebook.presto.execution.QueryPreparer.PreparedQuery;
+import com.facebook.presto.execution.QueryTracker;
 import com.facebook.presto.execution.resourceGroups.ResourceGroupManager;
 import com.facebook.presto.execution.warnings.WarningCollectorFactory;
 import com.facebook.presto.metadata.SessionPropertyManager;
@@ -45,7 +50,9 @@ import org.weakref.jmx.Managed;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
-import java.util.*;
+
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 
 import static com.facebook.presto.SystemSessionProperties.getWarningHandlingLevel;
@@ -120,21 +127,7 @@ public class DispatchManager
 
         this.queryTracker = new QueryTracker<>(queryManagerConfig, dispatchExecutor.getScheduledExecutor());
 
-        Map<String, Map<String, List<String>>> localdb = new HashMap<>();
-        localdb.put("Morningside Heights", new HashMap<String, List<String>>());
-        localdb.get("Morningside Heights").put("measurements", new LinkedList<String>());
-        localdb.get("Morningside Heights").get("measurements").add("one.public");
-        localdb.get("Morningside Heights").get("measurements").add("two.public");
-
-        localdb.put("Butler Library", new HashMap<>());
-        localdb.get("Butler Library").put("measurements", new LinkedList<>());
-        localdb.get("Butler Library").get("measurements").add("one.public");
-
-        localdb.put("Lerner Hall", new HashMap<>());
-        localdb.get("Lerner Hall").put("measurements", new LinkedList<>());
-        localdb.get("Lerner Hall").get("measurements").add("two.public");
-
-        this.senSQLModule = new SenSQLModule(localdb);
+        this.senSQLModule = new SenSQLModule();
     }
     @PostConstruct
     public void start()
