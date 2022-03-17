@@ -18,59 +18,54 @@ import com.facebook.presto.execution.QueryPreparer;
 import com.facebook.presto.spi.WarningCollector;
 import com.facebook.presto.sql.analyzer.SemanticException;
 import com.facebook.presto.sql.parser.SqlParser;
-import com.facebook.presto.sql.planner.plan.WindowNode;
+import com.facebook.presto.sql.tree.AstVisitor;
+import com.facebook.presto.sql.tree.BooleanLiteral;
+import com.facebook.presto.sql.tree.Expression;
+import com.facebook.presto.sql.tree.Identifier;
+import com.facebook.presto.sql.tree.Join;
 import com.facebook.presto.sql.tree.LogicalBinaryExpression;
+import com.facebook.presto.sql.tree.Node;
+import com.facebook.presto.sql.tree.NotExpression;
+import com.facebook.presto.sql.tree.QualifiedName;
+import com.facebook.presto.sql.tree.Query;
+import com.facebook.presto.sql.tree.QueryBody;
 import com.facebook.presto.sql.tree.QuerySpecification;
+import com.facebook.presto.sql.tree.Relation;
 import com.facebook.presto.sql.tree.Statement;
 import com.facebook.presto.sql.tree.Table;
-import com.facebook.presto.sql.tree.BooleanLiteral;
-import org.postgresql.PGConnection;
-import sun.jvm.hotspot.types.basic.BasicOopField;
-import com.facebook.presto.sql.tree.Query;
-import com.facebook.presto.sql.tree.Join;
-import com.facebook.presto.sql.tree.Relation;
+import com.facebook.presto.sql.tree.Union;
 import com.facebook.presto.sql.tree.With;
 import com.facebook.presto.sql.tree.WithQuery;
-import com.facebook.presto.sql.tree.Union;
-import com.facebook.presto.sql.tree.Expression;
-import com.facebook.presto.sql.tree.Node;
-import com.facebook.presto.sql.tree.QueryBody;
-import com.facebook.presto.sql.tree.Identifier;
-import com.facebook.presto.sql.tree.QualifiedName;
-import com.facebook.presto.sql.tree.NotExpression;
-import com.facebook.presto.sql.tree.StringLiteral;
-import com.facebook.presto.sql.tree.ComparisonExpression;
-import com.facebook.presto.sql.tree.AstVisitor;
+import org.postgresql.Driver;
 
-import sun.rmi.runtime.Log;
-
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.net.Socket;
 import java.sql.Connection;
-//import java.sql.Driver;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.text.ParseException;
-import java.util.*;
-
-import org.postgresql.Driver;
+import java.util.Arrays;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.function.Function;
 
 import static com.facebook.presto.sql.ParsingUtil.createParsingOptions;
 import static java.util.Objects.requireNonNull;
 
 public class SenSQLModule
 {
-    private Map<String, Map<String, List<String>>> localdb;
     private Connection localDB;
     private Driver driver;
    // private List<Expression> forwardClauses;
+//    final private ConditionTrim localQueryCondition = this::checkCond;
+//    private ConditionTrim forwardQueryCondition = this::
+//    @FunctionalInterface
+//    interface ConditionTrim {
+//        void checkCond(Expression condition);
+//    }
 
-    public SenSQLModule(Map<String, Map<String, List<String>>> map)
+    public SenSQLModule()
     {
         System.out.println("Init SenSQLModule");
-        this.localdb = map;
         try {
             System.out.println("attempting localDB connection");
             this.driver = new Driver();
@@ -83,18 +78,15 @@ public class SenSQLModule
             java.sql.Statement s = this.localDB.createStatement();
             s.executeUpdate("set session.uid='R2wzx2ovqEeBSjcRxgPZ9ZNT2j33';");
             s.close();
-
         }
         catch (SQLException e) {
             System.out.println("FAILED TO CONNECT TO LOCALDB");
             e.printStackTrace();
         }
-
     }
 
     public QueryPreparer.PreparedQuery rewrite(QuerySpecification originalBody, QueryPreparer queryPreparer, Session session, WarningCollector warningCollector)
     {
-
         // get relation name from 'from' clause
         if (originalBody.from.isPresent()) {
             originalBody.from = Optional.of(processFrom(originalBody.from.get()));
@@ -111,13 +103,12 @@ public class SenSQLModule
             // make copy for forward query
             localQuery = queryPreparer.sqlParser.createStatement("select nodes.id from\n" +
                     "nodes, feature, shape where\n" +
-                    /*"st_intersects(shape.geometries, nodes.service_region) and*/" shape.id = feature.shape and "
-                    + originalBody.where.get()) ;
-
+                    "st_intersects(shape.geometries, nodes.service_region) and shape.id = feature.shape and "
+                    + originalBody.where.get());
             // process where clause for presto query
 //            System.out.println("original where: " + originalBody.where);
 //            System.out.println("-- beginning recursion --");
-            originalBody.where = Optional.of(processWhere((LogicalBinaryExpression) originalBody.where.get(), new LinkedList<>()));
+            originalBody.where = Optional.of(processWhere(originalBody.where.get(), this::checkCond));
 //            System.out.println("-- end recursion --");
             if (originalBody.where.get() instanceof BooleanLiteral) {
                 originalBody.where = Optional.empty();
@@ -131,7 +122,7 @@ public class SenSQLModule
             QuerySpecification forwardBody = ((QuerySpecification) ((((Query) localQuery).getQueryBody())));
 
 //            System.out.println("-- beginning recursion --");
-            forwardBody.where = Optional.of(processWhereBackend(forwardBody.where.get()));
+            forwardBody.where = Optional.of(processWhere(forwardBody.where.get(), this::checkCondBackend));
 //            System.out.println("-- end recursion --");
             forwardString = "select " + forwardBody.select.getSelectItems().get(0)
                     + " from " + ((Table) ((Join) ((Join) forwardBody.from.get()).getLeft()).getLeft()).getName() + ", "
@@ -153,12 +144,12 @@ public class SenSQLModule
                 sqle.printStackTrace();
             }
         }
+//        if (whereList.size() == 0) {
+//            whereList.add("test3");
+//        }
 
         System.out.print("catalogs from localDB: " + whereList);
         // default location = 'Morningside Heights' if none found
-        if (whereList.size() == 0) {
-            whereList.add("Morningside Heights");
-        }
 
 //        System.out.println("forwardList: " + this.forwardClauses);
 //        QuerySpecification localBody = ((QuerySpecification) ((((Query) localQuery).getQueryBody())));
@@ -216,7 +207,7 @@ public class SenSQLModule
         return result;
     }
 
-    private Expression processWhere(Expression expression, List<String> whereList)
+    private Expression processWhere(Expression expression, Function<Expression, Boolean> condition)
     {
 //        System.out.println(expression.toString());
 
@@ -224,29 +215,32 @@ public class SenSQLModule
             LogicalBinaryExpression lbExpression = (LogicalBinaryExpression) expression;
 
             try {
-                lbExpression.right = processWhere(lbExpression.right, whereList);
+                lbExpression.right = processWhere(lbExpression.right, condition);
             }
             catch (ClassCastException e) {
             }
 
             try {
-                lbExpression.left = processWhere(lbExpression.left, whereList);
+                lbExpression.left = processWhere(lbExpression.left, condition);
             }
             catch (ClassCastException e) {
             }
-
+            // removing both left & right expressions
             if (lbExpression.left instanceof BooleanLiteral && lbExpression.right instanceof BooleanLiteral) {
                 return new BooleanLiteral(true);
             }
+            // removing only left
             else if (lbExpression.left instanceof BooleanLiteral) {
                 return lbExpression.right;
             }
+            // removing only right
             else if (lbExpression.right instanceof BooleanLiteral) {
                 return lbExpression.left;
             }
+            // removing neither
             else {
-                boolean left = checkCond(lbExpression.left, whereList);
-                boolean right = checkCond(lbExpression.right, whereList);
+                boolean left = condition.apply(lbExpression.left);
+                boolean right = condition.apply(lbExpression.right);
                 if (left && right) {
                     if (lbExpression.getOperator().equals(LogicalBinaryExpression.Operator.AND)) {
                         return new BooleanLiteral(true);
@@ -268,7 +262,7 @@ public class SenSQLModule
         }
         try {
             NotExpression nExpression = (NotExpression) expression;
-            if (checkCond(nExpression, whereList)) {
+            if (condition.apply(nExpression)) {
                 return new BooleanLiteral(true);
             }
             else {
@@ -277,15 +271,14 @@ public class SenSQLModule
         }
         catch (ClassCastException e) {
         }
-        if (checkCond(expression, whereList)) {
+        if (condition.apply(expression)) {
             return new BooleanLiteral(true);
         }
         return expression;
     }
 
-    private boolean checkCond(Expression condition, List<String> whereList)
+    private boolean checkCond(Expression condition)
     {
-
         try {
             if (!(condition instanceof LogicalBinaryExpression)) {
 //                System.out.println("checking condition: " + condition.toString());
@@ -375,7 +368,7 @@ public class SenSQLModule
 //                    System.out.println("contains 'measurements'");
 //                }
                 if ((!condition.toString().contains("feature") && !condition.toString().contains("shape"))
-                        || condition.toString().contains("measurements") || condition.toString().contains("st_")) {
+                        || condition.toString().contains("measurements")/* || condition.toString().contains("st_")*/) {
 //                    this.forwardClauses.add(Condition);
                     return true;
                 }
