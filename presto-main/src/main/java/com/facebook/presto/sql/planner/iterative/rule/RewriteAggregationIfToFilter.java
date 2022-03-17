@@ -14,21 +14,28 @@
 package com.facebook.presto.sql.planner.iterative.rule;
 
 import com.facebook.presto.Session;
+import com.facebook.presto.common.function.OperatorType;
+import com.facebook.presto.expressions.DefaultRowExpressionTraversalVisitor;
 import com.facebook.presto.matching.Capture;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
+import com.facebook.presto.spi.function.StandardFunctionResolution;
 import com.facebook.presto.spi.plan.AggregationNode;
 import com.facebook.presto.spi.plan.AggregationNode.Aggregation;
 import com.facebook.presto.spi.plan.Assignments;
 import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.plan.ProjectNode;
 import com.facebook.presto.spi.relation.CallExpression;
+import com.facebook.presto.spi.relation.LambdaDefinitionExpression;
 import com.facebook.presto.spi.relation.RowExpression;
 import com.facebook.presto.spi.relation.SpecialFormExpression;
 import com.facebook.presto.spi.relation.VariableReferenceExpression;
+import com.facebook.presto.sql.analyzer.FeaturesConfig.AggregationIfToFilterRewriteStrategy;
+import com.facebook.presto.sql.planner.VariablesExtractor;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.relational.Expressions;
+import com.facebook.presto.sql.relational.FunctionResolution;
 import com.facebook.presto.sql.relational.RowExpressionDeterminismEvaluator;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
@@ -38,12 +45,16 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import static com.facebook.presto.SystemSessionProperties.isAggregationIfToFilterRewriteEnabled;
+import static com.facebook.presto.SystemSessionProperties.getAggregationIfToFilterRewriteStrategy;
+import static com.facebook.presto.common.RuntimeMetricName.REWRITE_AGGREGATION_IF_TO_FILTER_APPLIED;
 import static com.facebook.presto.expressions.LogicalRowExpressions.TRUE_CONSTANT;
 import static com.facebook.presto.expressions.LogicalRowExpressions.or;
 import static com.facebook.presto.matching.Capture.newCapture;
 import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.IF;
+import static com.facebook.presto.sql.analyzer.FeaturesConfig.AggregationIfToFilterRewriteStrategy.FILTER_WITH_IF;
+import static com.facebook.presto.sql.analyzer.FeaturesConfig.AggregationIfToFilterRewriteStrategy.UNWRAP_IF;
 import static com.facebook.presto.sql.planner.plan.Patterns.aggregation;
 import static com.facebook.presto.sql.planner.plan.Patterns.project;
 import static com.facebook.presto.sql.planner.plan.Patterns.source;
@@ -56,12 +67,22 @@ import static java.util.function.Function.identity;
  * A optimizer rule which rewrites
  * AGG(IF(condition, expr))
  * to
+ * AGG(IF(condition, expr)) FILTER (WHERE condition).
+ * if AGGREGATION_IF_TO_FILTER_REWRITE_STRATEGY is FILTER_WITH_IF,
+ * or
  * AGG(expr) FILTER (WHERE condition).
+ * if AGGREGATION_IF_TO_FILTER_REWRITE_STRATEGY is UNWRAP_IF.
  * <p>
- * The latter plan is more efficient because:
+ * The rewritten plan is more efficient because:
  * 1. The filter can be pushed down to the scan node.
  * 2. The rows not matching the condition are not aggregated.
- * 3. The IF() expression wrapper is removed.
+ * <p>
+ * Note that unwrapping the IF expression in the aggregate might cause issues if the true branch return errors for rows not matching the filters. For example:
+ * 'IF(CARDINALITY(array) > 0, array[1]))'
+ * Session property AGGREGATION_IF_TO_FILTER_REWRITE_STRATEGY and canUnwrapIf() control whether to enable IF unwrapping:
+ * 1. If the strategy is FILTER_WITH_IF, then keep the IF expression.
+ * 2. If the strategy is UNWRAP_IF_SAFE,  then unwrap the IF expression if it is safe to do so.
+ * 3. If the strategy is UNWRAP_IF, then unwrap the IF expression after it passes the checks; note that this is an unsafe mode since the checks are not exhaustive.
  */
 public class RewriteAggregationIfToFilter
         implements Rule<AggregationNode>
@@ -73,17 +94,19 @@ public class RewriteAggregationIfToFilter
 
     private final FunctionAndTypeManager functionAndTypeManager;
     private final RowExpressionDeterminismEvaluator rowExpressionDeterminismEvaluator;
+    private final StandardFunctionResolution standardFunctionResolution;
 
     public RewriteAggregationIfToFilter(FunctionAndTypeManager functionAndTypeManager)
     {
         this.functionAndTypeManager = requireNonNull(functionAndTypeManager, "functionManager is null");
-        rowExpressionDeterminismEvaluator = new RowExpressionDeterminismEvaluator(functionAndTypeManager);
+        this.rowExpressionDeterminismEvaluator = new RowExpressionDeterminismEvaluator(functionAndTypeManager);
+        this.standardFunctionResolution = new FunctionResolution(functionAndTypeManager);
     }
 
     @Override
     public boolean isEnabled(Session session)
     {
-        return isAggregationIfToFilterRewriteEnabled(session);
+        return getAggregationIfToFilterRewriteStrategy(session).ordinal() > AggregationIfToFilterRewriteStrategy.DISABLED.ordinal();
     }
 
     @Override
@@ -104,8 +127,9 @@ public class RewriteAggregationIfToFilter
             return Result.empty();
         }
 
+        context.getSession().getRuntimeStats().addMetricValue(REWRITE_AGGREGATION_IF_TO_FILTER_APPLIED, 1);
         // Get the corresponding assignments in the input project.
-        // The aggregationReferences only has the aggregations to rewrite, thus the sourceAssignments only has IF expressions with NULL false results.
+        // The aggregationReferences only has the aggregations to rewrite, thus the sourceAssignments only has IF/CAST(IF) expressions with NULL false results.
         // Multiple aggregations may reference the same input. We use a map to dedup them based on the VariableReferenceExpression, so that we only do the rewrite once per input
         // IF expression.
         // The order of sourceAssignments determines the order of generating the new variables for the IF conditions and results. We use a sorted map to get a deterministic
@@ -115,27 +139,41 @@ public class RewriteAggregationIfToFilter
                 .collect(toImmutableSortedMap(VariableReferenceExpression::compareTo, identity(), variable -> sourceProject.getAssignments().get(variable), (left, right) -> left));
 
         Assignments.Builder newAssignments = Assignments.builder();
-        // We don't remove the IF expression now in case the aggregation has other references to it. These will be cleaned up by the PruneUnreferencedOutputs rule later.
         newAssignments.putAll(sourceProject.getAssignments());
 
-        // Map from the aggregation reference to the IF condition reference.
+        // Map from the aggregation reference to the IF condition reference which will be put in the mask.
         Map<VariableReferenceExpression, VariableReferenceExpression> aggregationReferenceToConditionReference = new HashMap<>();
-        // Map from the aggregation reference to the IF result reference.
+        // Map from the aggregation reference to the IF result reference. This only contains the aggregates where the IF can be safely unwrapped.
+        // E.g., SUM(IF(CARDINALITY(array) > 0, array[1])) will not be included in this map as array[1] can return errors if we unwrap the IF.
         Map<VariableReferenceExpression, VariableReferenceExpression> aggregationReferenceToIfResultReference = new HashMap<>();
 
+        AggregationIfToFilterRewriteStrategy rewriteStrategy = getAggregationIfToFilterRewriteStrategy(context.getSession());
         for (Map.Entry<VariableReferenceExpression, RowExpression> entry : sourceAssignments.entrySet()) {
             VariableReferenceExpression outputVariable = entry.getKey();
-            SpecialFormExpression ifExpression = (SpecialFormExpression) entry.getValue();
+            RowExpression rowExpression = entry.getValue();
+            SpecialFormExpression ifExpression = (SpecialFormExpression) ((rowExpression instanceof CallExpression)
+                    ? ((CallExpression) rowExpression).getArguments().get(0)
+                    : rowExpression);
 
             RowExpression condition = ifExpression.getArguments().get(0);
             VariableReferenceExpression conditionReference = context.getVariableAllocator().newVariable(condition);
             newAssignments.put(conditionReference, condition);
             aggregationReferenceToConditionReference.put(outputVariable, conditionReference);
 
-            RowExpression trueResult = ifExpression.getArguments().get(1);
-            VariableReferenceExpression ifResultReference = context.getVariableAllocator().newVariable(trueResult);
-            newAssignments.put(ifResultReference, trueResult);
-            aggregationReferenceToIfResultReference.put(outputVariable, ifResultReference);
+            if (canUnwrapIf(ifExpression, rewriteStrategy)) {
+                RowExpression trueResult = ifExpression.getArguments().get(1);
+                if (rowExpression instanceof CallExpression) {
+                    // Wrap the result with CAST().
+                    trueResult = new CallExpression(
+                            ((CallExpression) rowExpression).getDisplayName(),
+                            ((CallExpression) rowExpression).getFunctionHandle(),
+                            rowExpression.getType(),
+                            ImmutableList.of(trueResult));
+                }
+                VariableReferenceExpression ifResultReference = context.getVariableAllocator().newVariable(trueResult);
+                newAssignments.put(ifResultReference, trueResult);
+                aggregationReferenceToIfResultReference.put(outputVariable, ifResultReference);
+            }
         }
 
         // Build new aggregations.
@@ -151,13 +189,18 @@ public class RewriteAggregationIfToFilter
             }
             VariableReferenceExpression aggregationReference = (VariableReferenceExpression) aggregation.getArguments().get(0);
             CallExpression callExpression = aggregation.getCall();
+            VariableReferenceExpression ifResultReference = aggregationReferenceToIfResultReference.get(aggregationReference);
+            if (ifResultReference != null) {
+                callExpression = new CallExpression(
+                        callExpression.getSourceLocation(),
+                        callExpression.getDisplayName(),
+                        callExpression.getFunctionHandle(),
+                        callExpression.getType(),
+                        ImmutableList.of(ifResultReference));
+            }
             VariableReferenceExpression mask = aggregationReferenceToConditionReference.get(aggregationReference);
             aggregations.put(output, new Aggregation(
-                    new CallExpression(
-                            callExpression.getDisplayName(),
-                            callExpression.getFunctionHandle(),
-                            callExpression.getType(),
-                            ImmutableList.of(aggregationReferenceToIfResultReference.get(aggregationReference))),
+                    callExpression,
                     Optional.empty(),
                     aggregation.getOrderBy(),
                     aggregation.isDistinct(),
@@ -172,8 +215,10 @@ public class RewriteAggregationIfToFilter
         }
         return Result.ofPlanNode(
                 new AggregationNode(
+                        aggregationNode.getSourceLocation(),
                         context.getIdAllocator().getNextId(),
                         new FilterNode(
+                                aggregationNode.getSourceLocation(),
                                 context.getIdAllocator().getNextId(),
                                 new ProjectNode(
                                         context.getIdAllocator().getNextId(),
@@ -203,11 +248,65 @@ public class RewriteAggregationIfToFilter
             return false;
         }
         RowExpression sourceExpression = sourceProject.getAssignments().get((VariableReferenceExpression) aggregation.getArguments().get(0));
+        if (sourceExpression instanceof CallExpression) {
+            CallExpression callExpression = (CallExpression) sourceExpression;
+            if (callExpression.getArguments().size() == 1 && standardFunctionResolution.isCastFunction(callExpression.getFunctionHandle())) {
+                // If the expression is CAST(), check the expression inside.
+                sourceExpression = callExpression.getArguments().get(0);
+            }
+        }
         if (!(sourceExpression instanceof SpecialFormExpression) || !rowExpressionDeterminismEvaluator.isDeterministic(sourceExpression)) {
             return false;
         }
         SpecialFormExpression expression = (SpecialFormExpression) sourceExpression;
         // Only rewrite the aggregation if the else branch is not present or the else result is NULL.
         return expression.getForm() == IF && Expressions.isNull(expression.getArguments().get(2));
+    }
+
+    private boolean canUnwrapIf(SpecialFormExpression ifExpression, AggregationIfToFilterRewriteStrategy rewriteStrategy)
+    {
+        if (rewriteStrategy == FILTER_WITH_IF) {
+            return false;
+        }
+
+        // Some use cases use IF expression to avoid returning errors when evaluating the true branch. For example, IF(CARDINALITY(array) > 0, array[1])).
+        // We shouldn't unwrap the IF for those cases.
+        // But if the condition expression doesn't reference any variables referenced in the true branch, unwrapping the if should not cause exceptions for the true branch.
+        Set<VariableReferenceExpression> ifConditionReferences = VariablesExtractor.extractUnique(ifExpression.getArguments().get(0));
+        Set<VariableReferenceExpression> ifResultReferences = VariablesExtractor.extractUnique(ifExpression.getArguments().get(1));
+        if (ifConditionReferences.stream().noneMatch(ifResultReferences::contains)) {
+            return true;
+        }
+
+        if (rewriteStrategy != UNWRAP_IF) {
+            return false;
+        }
+
+        AtomicBoolean result = new AtomicBoolean(true);
+        ifExpression.getArguments().get(1).accept(new DefaultRowExpressionTraversalVisitor<AtomicBoolean>()
+        {
+            @Override
+            public Void visitLambda(LambdaDefinitionExpression lambda, AtomicBoolean result)
+            {
+                // Unwrapping the IF expression in the aggregate might cause issues if the true branch return errors for rows not matching the filters.
+                // To be safe, we don't unwrap the IF expressions when the true branch has lambdas.
+                result.set(false);
+                return null;
+            }
+
+            @Override
+            public Void visitCall(CallExpression call, AtomicBoolean result)
+            {
+                Optional<OperatorType> operatorType = functionAndTypeManager.getFunctionMetadata(call.getFunctionHandle()).getOperatorType();
+                // Unwrapping the IF expression in the aggregate might cause issues if the true branch return errors for rows not matching the filters.
+                // For example, array[1] could return out of bound error and a / b could return DIVISION_BY_ZERO error. So we doesn't unwrap the IF expression in these cases.
+                if (operatorType.isPresent() && (operatorType.get() == OperatorType.DIVIDE || operatorType.get() == OperatorType.SUBSCRIPT)) {
+                    result.set(false);
+                    return null;
+                }
+                return super.visitCall(call, result);
+            }
+        }, result);
+        return result.get();
     }
 }

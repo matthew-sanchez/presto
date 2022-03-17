@@ -15,7 +15,9 @@ package com.facebook.presto.execution;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.client.NodeVersion;
+import com.facebook.presto.dispatcher.NoOpQueryManager;
 import com.facebook.presto.execution.scheduler.LegacyNetworkTopology;
+import com.facebook.presto.execution.scheduler.ModularHashingNodeProvider;
 import com.facebook.presto.execution.scheduler.NetworkLocation;
 import com.facebook.presto.execution.scheduler.NetworkLocationCache;
 import com.facebook.presto.execution.scheduler.NetworkTopology;
@@ -24,47 +26,75 @@ import com.facebook.presto.execution.scheduler.NodeSchedulerConfig;
 import com.facebook.presto.execution.scheduler.SplitPlacementResult;
 import com.facebook.presto.execution.scheduler.nodeSelection.NodeSelectionStats;
 import com.facebook.presto.execution.scheduler.nodeSelection.NodeSelector;
+import com.facebook.presto.execution.scheduler.nodeSelection.SimpleTtlNodeSelectorConfig;
 import com.facebook.presto.metadata.InMemoryNodeManager;
 import com.facebook.presto.metadata.InternalNode;
 import com.facebook.presto.metadata.Split;
+import com.facebook.presto.server.BasicQueryInfo;
+import com.facebook.presto.server.BasicQueryStats;
 import com.facebook.presto.spi.ConnectorId;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.HostAddress;
+import com.facebook.presto.spi.NodeProvider;
+import com.facebook.presto.spi.QueryId;
+import com.facebook.presto.spi.SplitWeight;
 import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.spi.schedule.NodeSelectionStrategy;
+import com.facebook.presto.spi.ttl.ConfidenceBasedTtlInfo;
+import com.facebook.presto.spi.ttl.NodeInfo;
+import com.facebook.presto.spi.ttl.NodeTtl;
+import com.facebook.presto.spi.ttl.NodeTtlFetcherFactory;
+import com.facebook.presto.spi.ttl.TestingNodeTtlFetcherFactory;
 import com.facebook.presto.testing.TestingSession;
 import com.facebook.presto.testing.TestingTransactionHandle;
+import com.facebook.presto.ttl.nodettlfetchermanagers.ConfidenceBasedNodeTtlFetcherManager;
+import com.facebook.presto.ttl.nodettlfetchermanagers.NodeTtlFetcherManagerConfig;
+import com.facebook.presto.ttl.nodettlfetchermanagers.ThrowingNodeTtlFetcherManager;
 import com.facebook.presto.util.FinalizerService;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.net.URI;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 
 import static com.facebook.airlift.concurrent.Threads.daemonThreadsNamed;
 import static com.facebook.presto.SystemSessionProperties.MAX_UNACKNOWLEDGED_SPLITS_PER_TASK;
+import static com.facebook.presto.SystemSessionProperties.RESOURCE_AWARE_SCHEDULING_STRATEGY;
 import static com.facebook.presto.execution.scheduler.NetworkLocation.ROOT_LOCATION;
+import static com.facebook.presto.execution.scheduler.NodeSelectionHashStrategy.CONSISTENT_HASHING;
 import static com.facebook.presto.spi.schedule.NodeSelectionStrategy.HARD_AFFINITY;
 import static com.facebook.presto.spi.schedule.NodeSelectionStrategy.NO_PREFERENCE;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
@@ -109,7 +139,15 @@ public class TestNodeScheduler
                 .setIncludeCoordinator(false)
                 .setMaxPendingSplitsPerTask(10);
 
-        nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap);
+        nodeScheduler = new NodeScheduler(
+                new LegacyNetworkTopology(),
+                nodeManager,
+                new NodeSelectionStats(),
+                nodeSchedulerConfig,
+                nodeTaskMap,
+                new ThrowingNodeTtlFetcherManager(),
+                new NoOpQueryManager(),
+                new SimpleTtlNodeSelectorConfig());
         // contents of taskMap indicate the node-task map for the current stage
         taskMap = new HashMap<>();
         nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID);
@@ -130,6 +168,77 @@ public class TestNodeScheduler
         nodeSelector = null;
     }
 
+    private class TestingQueryManager
+            extends NoOpQueryManager
+    {
+        private Duration executionTime;
+
+        private BasicQueryStats getBasicQueryStats(Duration executionTime)
+        {
+            Duration defaultDuration = Duration.valueOf("5m");
+            return new BasicQueryStats(
+                    null,
+                    null,
+                    defaultDuration,
+                    defaultDuration,
+                    defaultDuration,
+                    executionTime,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    DataSize.valueOf("1MB"),
+                    0,
+                    0,
+                    0,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    false,
+                    ImmutableSet.of(),
+                    DataSize.valueOf("1MB"),
+                    OptionalDouble.empty());
+        }
+
+        private BasicQueryInfo getBasicQueryInfo(Duration executionTime)
+        {
+            return new BasicQueryInfo(
+                    session.getQueryId(),
+                    session.toSessionRepresentation(),
+                    Optional.empty(),
+                    QueryState.RUNNING,
+                    null,
+                    true,
+                    URI.create("http://127.0.0.1:55"),
+                    "",
+                    getBasicQueryStats(executionTime),
+                    null,
+                    null,
+                    null,
+                    Optional.empty(),
+                    ImmutableList.of(),
+                    Optional.empty());
+        }
+
+        @Override
+        public BasicQueryInfo getQueryInfo(QueryId queryId)
+        {
+            return getBasicQueryInfo(executionTime);
+        }
+
+        public void setExecutionTime(Duration executionTime)
+        {
+            this.executionTime = executionTime;
+        }
+    }
+
     @Test
     public void testScheduleLocal()
     {
@@ -137,7 +246,7 @@ public class TestNodeScheduler
         Set<Split> splits = ImmutableSet.of(split);
 
         Map.Entry<InternalNode, Split> assignment = Iterables.getOnlyElement(nodeSelector.computeAssignments(splits, ImmutableList.copyOf(taskMap.values())).getAssignments().entries());
-        assertEquals(assignment.getKey().getHostAndPort(), split.getPreferredNodes(ImmutableList.of()).get(0));
+        assertEquals(assignment.getKey().getHostAndPort(), split.getPreferredNodes(new ModularHashingNodeProvider(nodeSelector.getAllNodes())).get(0));
         assertEquals(assignment.getValue(), split);
     }
 
@@ -179,7 +288,7 @@ public class TestNodeScheduler
                 }
             }
         };
-        NodeScheduler nodeScheduler = new NodeScheduler(locationCache, topology, nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new Duration(5, SECONDS));
+        NodeScheduler nodeScheduler = new NodeScheduler(locationCache, topology, nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new Duration(5, SECONDS), new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
         NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID);
 
         // Fill up the nodes with non-local data
@@ -255,7 +364,7 @@ public class TestNodeScheduler
         int rack1 = 0;
         int rack2 = 0;
         for (Split split : unassigned) {
-            String rack = topology.locate(split.getPreferredNodes(ImmutableList.of()).get(0)).getSegments().get(0);
+            String rack = topology.locate(split.getPreferredNodes(new ModularHashingNodeProvider(nodeSelector.getAllNodes())).get(0)).getSegments().get(0);
             switch (rack) {
                 case "rack1":
                     rack1++;
@@ -278,6 +387,99 @@ public class TestNodeScheduler
         assignments = nodeSelector.computeAssignments(localSplits.build(), ImmutableList.copyOf(taskMap.values())).getAssignments();
         assertEquals(assignments.size(), 3);
         assertEquals(assignments.keySet().size(), 3);
+    }
+
+    @Test
+    public void testTtlAwareScheduling()
+    {
+        InMemoryNodeManager nodeManager = new InMemoryNodeManager();
+
+        InternalNode node1 = new InternalNode("other1", URI.create("http://127.0.0.1:11"), NodeVersion.UNKNOWN, false);
+        InternalNode node2 = new InternalNode("other2", URI.create("http://127.0.0.1:12"), NodeVersion.UNKNOWN, false);
+        InternalNode node3 = new InternalNode("other3", URI.create("http://127.0.0.1:13"), NodeVersion.UNKNOWN, false);
+        List<InternalNode> nodes = ImmutableList.of(node1, node2, node3);
+        nodeManager.addNode(CONNECTOR_ID, nodes);
+        NodeSchedulerConfig nodeSchedulerConfig = new NodeSchedulerConfig()
+                .setMaxSplitsPerNode(20)
+                .setIncludeCoordinator(false)
+                .setMaxPendingSplitsPerTask(10);
+
+        Instant currentInstant = Instant.now();
+        NodeTtl ttl1 = new NodeTtl(ImmutableSet.of(
+                new ConfidenceBasedTtlInfo(currentInstant.plus(5, ChronoUnit.MINUTES).getEpochSecond(), 100)));
+        NodeTtl ttl2 = new NodeTtl(ImmutableSet.of(
+                new ConfidenceBasedTtlInfo(currentInstant.plus(30, ChronoUnit.MINUTES).getEpochSecond(), 100)));
+        NodeTtl ttl3 = new NodeTtl(ImmutableSet.of(
+                new ConfidenceBasedTtlInfo(currentInstant.plus(2, ChronoUnit.HOURS).getEpochSecond(), 100)));
+        Map<NodeInfo, NodeTtl> nodeToTtl = ImmutableMap.of(
+                new NodeInfo(node1.getNodeIdentifier(), node1.getHost()),
+                ttl1,
+                new NodeInfo(node2.getNodeIdentifier(), node2.getHost()),
+                ttl2,
+                new NodeInfo(node3.getNodeIdentifier(), node3.getHost()),
+                ttl3);
+
+        ConfidenceBasedNodeTtlFetcherManager nodeTtlFetcherManager = new ConfidenceBasedNodeTtlFetcherManager(
+                nodeManager,
+                new NodeSchedulerConfig(),
+                new NodeTtlFetcherManagerConfig());
+        NodeTtlFetcherFactory nodeTtlFetcherFactory = new TestingNodeTtlFetcherFactory(nodeToTtl);
+        nodeTtlFetcherManager.addNodeTtlFetcherFactory(nodeTtlFetcherFactory);
+        nodeTtlFetcherManager.load(nodeTtlFetcherFactory.getName(), ImmutableMap.of());
+        nodeTtlFetcherManager.refreshTtlInfo();
+
+        TestingQueryManager queryManager = new TestingQueryManager();
+        NodeScheduler nodeScheduler = new NodeScheduler(
+                new LegacyNetworkTopology(),
+                nodeManager,
+                new NodeSelectionStats(),
+                nodeSchedulerConfig,
+                nodeTaskMap,
+                nodeTtlFetcherManager,
+                queryManager,
+                new SimpleTtlNodeSelectorConfig());
+
+        // Query is estimated to take 20 mins and has been executing for 3 mins, i.e, 17 mins left
+        // So only node2 and node3 have enough TTL to run additional work
+        Session session = sessionWithTtlAwareSchedulingStrategyAndEstimatedExecutionTime(new Duration(20, TimeUnit.MINUTES));
+        NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID);
+        queryManager.setExecutionTime(new Duration(3, TimeUnit.MINUTES));
+        assertEquals(ImmutableSet.copyOf(nodeSelector.selectRandomNodes(3)), ImmutableSet.of(node2, node3));
+
+        // Query is estimated to take 1 hour and has been executing for 45 mins, i.e, 15 mins left
+        // So only node2 and node3 have enough TTL to work on new splits
+        session = sessionWithTtlAwareSchedulingStrategyAndEstimatedExecutionTime(new Duration(1, TimeUnit.HOURS));
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID);
+        queryManager.setExecutionTime(new Duration(45, TimeUnit.MINUTES));
+        Set<Split> splits = new HashSet<>();
+        for (int i = 0; i < 2; i++) {
+            splits.add(new Split(CONNECTOR_ID, TestingTransactionHandle.create(), new TestSplitRemote()));
+        }
+        Multimap<InternalNode, Split> assignments = nodeSelector.computeAssignments(splits, ImmutableList.copyOf(taskMap.values())).getAssignments();
+        assertEquals(assignments.size(), 2);
+        assertTrue(assignments.keySet().contains(node2));
+        assertTrue(assignments.keySet().contains(node3));
+
+        // Query is estimated to take 1 hour and has been executing for 20 mins, i.e, 40 mins left
+        // So only node3 has enough TTL to work on new splits
+        MockRemoteTaskFactory remoteTaskFactory = new MockRemoteTaskFactory(remoteTaskExecutor, remoteTaskScheduledExecutor);
+        TaskId taskId = new TaskId("test", 1, 0, 1);
+        RemoteTask newRemoteTask = remoteTaskFactory.createTableScanTask(taskId, node2, ImmutableList.of(), nodeTaskMap.createTaskStatsTracker(node2, taskId));
+        taskMap.put(node2, newRemoteTask);
+        nodeTaskMap.addTask(node2, newRemoteTask);
+
+        session = sessionWithTtlAwareSchedulingStrategyAndEstimatedExecutionTime(new Duration(1, TimeUnit.HOURS));
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID);
+        queryManager.setExecutionTime(new Duration(20, TimeUnit.MINUTES));
+        splits.clear();
+        for (int i = 0; i < 2; i++) {
+            splits.add(new Split(CONNECTOR_ID, TestingTransactionHandle.create(), new TestSplitRemote()));
+        }
+
+        assignments = nodeSelector.computeAssignments(splits, ImmutableList.copyOf(taskMap.values())).getAssignments();
+        assertEquals(assignments.size(), 2);
+        assertEquals(assignments.keySet().size(), 1);
+        assertTrue(assignments.keySet().contains(node3));
     }
 
     @Test
@@ -333,7 +535,8 @@ public class TestNodeScheduler
                 .setIncludeCoordinator(false)
                 .setMaxPendingSplitsPerTask(10);
 
-        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap);
+        LegacyNetworkTopology legacyNetworkTopology = new LegacyNetworkTopology();
+        NodeScheduler nodeScheduler = new NodeScheduler(new NetworkLocationCache(legacyNetworkTopology), legacyNetworkTopology, nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new Duration(0, SECONDS), new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
         NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 2);
 
         Set<Split> splits = new HashSet<>();
@@ -347,7 +550,7 @@ public class TestNodeScheduler
     }
 
     @Test
-    public void testAffinityAssignment()
+    public void testAffinityAssignmentWithModularHashing()
     {
         NodeTaskMap nodeTaskMap = new NodeTaskMap(finalizerService);
         TestingTransactionHandle transactionHandle = TestingTransactionHandle.create();
@@ -356,7 +559,7 @@ public class TestNodeScheduler
                 .setIncludeCoordinator(false)
                 .setMaxPendingSplitsPerTask(10);
 
-        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap);
+        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
         NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
 
         Set<Split> splits = new HashSet<>();
@@ -385,6 +588,145 @@ public class TestNodeScheduler
     }
 
     @Test
+    public void testAffinityAssignmentWithConsistentHashing()
+    {
+        NodeTaskMap nodeTaskMap = new NodeTaskMap(finalizerService);
+        TestingTransactionHandle transactionHandle = TestingTransactionHandle.create();
+        NodeSchedulerConfig nodeSchedulerConfig = new NodeSchedulerConfig()
+                .setNodeSelectionHashStrategy(CONSISTENT_HASHING)
+                .setMinVirtualNodeCount(3)
+                .setMaxSplitsPerNode(20)
+                .setIncludeCoordinator(false)
+                .setMaxPendingSplitsPerTask(10);
+
+        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
+        NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
+
+        Set<Split> splits = new HashSet<>();
+        IntStream.range(0, 10).forEach(i -> splits.add(new Split(CONNECTOR_ID, transactionHandle, new TestAffinitySplitRemote(i))));
+
+        InternalNode node1 = new InternalNode("other1", URI.create("http://127.0.0.1:11"), NodeVersion.UNKNOWN, false);
+        InternalNode node2 = new InternalNode("other2", URI.create("http://127.0.0.1:12"), NodeVersion.UNKNOWN, false);
+        InternalNode node3 = new InternalNode("other3", URI.create("http://127.0.0.1:13"), NodeVersion.UNKNOWN, false);
+        InternalNode node4 = new InternalNode("other4", URI.create("http://127.0.0.1:14"), NodeVersion.UNKNOWN, false);
+
+        // In setup node 1-3 are added to node manager
+        SplitPlacementResult splitPlacementResult = nodeSelector.computeAssignments(splits, ImmutableList.of());
+        assertEquals(splitPlacementResult.getAssignments().keySet().size(), 3);
+        // node1: split 1, 3, 4, 5, 6, 7, 8, 9
+        Collection<ConnectorSplit> node1Splits = splitPlacementResult.getAssignments().get(node1).stream().map(Split::getConnectorSplit).collect(toImmutableSet());
+        // node2: 0
+        Collection<Object> node2Splits = splitPlacementResult.getAssignments().get(node2).stream().map(Split::getConnectorSplit).collect(toImmutableSet());
+        // node3: split 2
+        Collection<Object> node3Splits = splitPlacementResult.getAssignments().get(node3).stream().map(Split::getConnectorSplit).collect(toImmutableSet());
+
+        // Scheduling the same splits on the same set of nodes should give the same assignment
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
+        splitPlacementResult = nodeSelector.computeAssignments(splits, ImmutableList.of());
+        assertEquals(splitPlacementResult.getAssignments().get(node1).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node1Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node2).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node2Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node3).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node3Splits);
+
+        // Adding node4. Node4 is hashed in between node3 and node1, and all splits previously assigned to node1 are now assigned to node4. Assignment to node2 and node3 should not change.
+        nodeManager.addNode(CONNECTOR_ID, node4);
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
+        splitPlacementResult = nodeSelector.computeAssignments(splits, ImmutableList.of());
+        assertEquals(splitPlacementResult.getAssignments().keySet().size(), 3);
+        assertEquals(splitPlacementResult.getAssignments().get(node1), ImmutableList.of());
+        assertEquals(splitPlacementResult.getAssignments().get(node2).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node2Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node3).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node3Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node4).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node1Splits);
+    }
+
+    @Test
+    public void testAffinityAssignmentWithConsistentHashingWithVirtualNodes()
+    {
+        NodeTaskMap nodeTaskMap = new NodeTaskMap(finalizerService);
+        TestingTransactionHandle transactionHandle = TestingTransactionHandle.create();
+        NodeSchedulerConfig nodeSchedulerConfig = new NodeSchedulerConfig()
+                .setNodeSelectionHashStrategy(CONSISTENT_HASHING)
+                .setMinVirtualNodeCount(5)
+                .setMaxSplitsPerNode(20)
+                .setIncludeCoordinator(false)
+                .setMaxPendingSplitsPerTask(10);
+
+        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
+        NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
+
+        Set<Split> splits = new HashSet<>();
+        IntStream.range(0, 10).forEach(i -> splits.add(new Split(CONNECTOR_ID, transactionHandle, new TestAffinitySplitRemote(i))));
+
+        InternalNode node1 = new InternalNode("other1", URI.create("http://127.0.0.1:11"), NodeVersion.UNKNOWN, false);
+        InternalNode node2 = new InternalNode("other2", URI.create("http://127.0.0.1:12"), NodeVersion.UNKNOWN, false);
+        InternalNode node3 = new InternalNode("other3", URI.create("http://127.0.0.1:13"), NodeVersion.UNKNOWN, false);
+        InternalNode node4 = new InternalNode("other4", URI.create("http://127.0.0.1:14"), NodeVersion.UNKNOWN, false);
+
+        // In setup node 1-3 are added to node manager
+        // consistent hashing ring for nodes:
+        // entry0 (-1907319920): node2
+        // entry1 (-1028466245): node3
+        // entry2 ( -546736344): node2
+        // entry3 ( 1127574531): node3
+        // entry4 ( 1166245243): node1
+        // entry5 ( 2145381619): node1
+        SplitPlacementResult splitPlacementResult = nodeSelector.computeAssignments(splits, ImmutableList.of());
+        // hashing value for splits:
+        // 0: -1962219106 -> entry0 -> node2
+        // 1:   145569539 -> entry3 -> node3
+        // 2: -1599101205 -> entry1 -> node3
+        // 3:  -165119218 -> entry3 -> node3
+        // 4:  1142216720 -> entry4 -> node1
+        // 5:  1347620135 -> entry5 -> node1
+        // 6:  1232195252 -> entry5 -> node1
+        // 7:   427886318 -> entry3 -> node3
+        // 8:  1469878697 -> entry5 -> node1
+        // 9:   296801082 -> entry3 -> node3
+        assertEquals(splitPlacementResult.getAssignments().keySet().size(), 3);
+        // node1: split 4, 5, 6, 8
+        Collection<ConnectorSplit> node1Splits = splitPlacementResult.getAssignments().get(node1).stream().map(Split::getConnectorSplit).collect(toImmutableSet());
+        // node2: split 0
+        Collection<Object> node2Splits = splitPlacementResult.getAssignments().get(node2).stream().map(Split::getConnectorSplit).collect(toImmutableSet());
+        // node3: split 1, 2, 3, 7, 9
+        Collection<Object> node3Splits = splitPlacementResult.getAssignments().get(node3).stream().map(Split::getConnectorSplit).collect(toImmutableSet());
+
+        // Scheduling the same splits on the same set of nodes should give the same assignment
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
+        splitPlacementResult = nodeSelector.computeAssignments(splits, ImmutableList.of());
+        assertEquals(splitPlacementResult.getAssignments().get(node1).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node1Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node2).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node2Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node3).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node3Splits);
+
+        // Adding node4, consistent hashing ring for nodes:
+        // entry0 (-1907319920): node2
+        // entry1 (-1616890413): node4
+        // entry2 (-1028466245): node3
+        // entry3 ( -546736344): node2
+        // entry4 ( 1127574531): node3
+        // entry5 ( 1166245243): node1
+        // entry6 ( 1691928386): node4
+        // entry7 ( 2145381619): node1
+        nodeManager.addNode(CONNECTOR_ID, node4);
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
+        splitPlacementResult = nodeSelector.computeAssignments(splits, ImmutableList.of());
+        // hashing value for splits:
+        // 0: -1962219106 -> entry0 -> node2
+        // 1:   145569539 -> entry4 -> node3
+        // 2: -1599101205 -> entry2 -> node3
+        // 3:  -165119218 -> entry4 -> node3
+        // 4:  1142216720 -> entry5 -> node1
+        // 5:  1347620135 -> entry6 -> node4
+        // 6:  1232195252 -> entry6 -> node4
+        // 7:   427886318 -> entry4 -> node3
+        // 8:  1469878697 -> entry6 -> node4
+        // 9:   296801082 -> entry4 -> node3
+        assertEquals(splitPlacementResult.getAssignments().keySet().size(), 4);
+        assertEquals(splitPlacementResult.getAssignments().get(node1).stream().map(Split::getConnectorSplit).map(ConnectorSplit::getSplitIdentifier).collect(toImmutableSet()), ImmutableSet.of(4));
+        assertEquals(splitPlacementResult.getAssignments().get(node2).stream().map(Split::getConnectorSplit).collect(toImmutableSet()), node2Splits);
+        assertEquals(splitPlacementResult.getAssignments().get(node3).stream().map(Split::getConnectorSplit).map(ConnectorSplit::getSplitIdentifier).collect(toImmutableSet()), ImmutableSet.of(1, 2, 3, 7, 9));
+        assertEquals(splitPlacementResult.getAssignments().get(node4).stream().map(Split::getConnectorSplit).map(ConnectorSplit::getSplitIdentifier).collect(toImmutableSet()), ImmutableSet.of(5, 6, 8));
+    }
+
+    @Test
     public void testHardAffinityAssignment()
     {
         NodeTaskMap nodeTaskMap = new NodeTaskMap(finalizerService);
@@ -394,7 +736,7 @@ public class TestNodeScheduler
                 .setIncludeCoordinator(false)
                 .setMaxPendingSplitsPerTask(10);
 
-        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap);
+        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
         NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 3);
 
         Set<Split> splits = new HashSet<>();
@@ -444,7 +786,7 @@ public class TestNodeScheduler
         remoteTask1.abort();
         remoteTask2.abort();
 
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(newNode), 0);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(newNode), PartitionedSplitsInfo.forZeroSplits());
     }
 
     @Test
@@ -491,7 +833,7 @@ public class TestNodeScheduler
         for (RemoteTask task : tasks) {
             task.abort();
         }
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(newNode), 0);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(newNode), PartitionedSplitsInfo.forZeroSplits());
     }
 
     @Test
@@ -567,13 +909,13 @@ public class TestNodeScheduler
                 ImmutableList.of(new Split(CONNECTOR_ID, TestingTransactionHandle.create(), new TestSplitRemote())),
                 nodeTaskMap.createTaskStatsTracker(chosenNode, taskId));
         nodeTaskMap.addTask(chosenNode, remoteTask);
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), 1);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), standardWeightSplitsInfo(1));
         remoteTask.abort();
         MILLISECONDS.sleep(100); // Sleep until cache expires
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), 0);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), PartitionedSplitsInfo.forZeroSplits());
 
         remoteTask.abort();
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), 0);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), PartitionedSplitsInfo.forZeroSplits());
     }
 
     @Test
@@ -599,12 +941,71 @@ public class TestNodeScheduler
 
         nodeTaskMap.addTask(chosenNode, remoteTask1);
         nodeTaskMap.addTask(chosenNode, remoteTask2);
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), 3);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), standardWeightSplitsInfo(3));
 
         remoteTask1.abort();
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), 1);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), standardWeightSplitsInfo(1));
         remoteTask2.abort();
-        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), 0);
+        assertEquals(nodeTaskMap.getPartitionedSplitsOnNode(chosenNode), PartitionedSplitsInfo.forZeroSplits());
+    }
+
+    @Test
+    public void testMoreSplitsAssignedWhenSplitsWeightsAreSmall()
+    {
+        int standardSplitsPerNode = nodeSchedulerConfig.getMaxSplitsPerNode();
+        int standardPendingSplitsPerTask = nodeSchedulerConfig.getMaxPendingSplitsPerTask();
+        int fullyLoadedStandardSplitCount = standardSplitsPerNode + standardPendingSplitsPerTask;
+        long weightLimitPerNode = SplitWeight.rawValueForStandardSplitCount(standardSplitsPerNode);
+        long weightLimitPendingPerTask = SplitWeight.rawValueForStandardSplitCount(standardPendingSplitsPerTask);
+        long fullyLoadedStandardSplitWeight = weightLimitPerNode + weightLimitPendingPerTask;
+
+        // Single worker node
+        nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 1);
+        InternalNode workerNode = nodeSelector.selectRandomNodes(1).get(0);
+        MockRemoteTaskFactory remoteTaskFactory = new MockRemoteTaskFactory(remoteTaskExecutor, remoteTaskScheduledExecutor);
+
+        TaskId taskId = new TaskId("test", 1, 0, 1);
+        MockRemoteTaskFactory.MockRemoteTask task = remoteTaskFactory.createTableScanTask(taskId, workerNode, ImmutableList.of(), nodeTaskMap.createTaskStatsTracker(workerNode, taskId));
+
+        TestingTransactionHandle transactionHandle = TestingTransactionHandle.create();
+        ImmutableSet.Builder<Split> splitsBuilder = ImmutableSet.builderWithExpectedSize(fullyLoadedStandardSplitCount * 2);
+        // Create 2x more splits than the standard split count limit, at 1/2 the standard weight
+        SplitWeight halfWeight = SplitWeight.fromProportion(0.5);
+        for (int i = 0; i < fullyLoadedStandardSplitCount * 2; i++) {
+            splitsBuilder.add(new Split(CONNECTOR_ID, transactionHandle, new TestSplitRemote(halfWeight)));
+        }
+        Set<Split> splits = splitsBuilder.build();
+        // Verify we arrived at the exact weight limit
+        assertEquals(SplitWeight.rawValueSum(splits, Split::getSplitWeight), fullyLoadedStandardSplitWeight);
+
+        // Node assignment limit met
+        SplitPlacementResult result = nodeSelector.computeAssignments(splits, ImmutableList.of(task));
+        assertEquals(result.getAssignments().get(workerNode).size(), standardSplitsPerNode * 2);
+        assertEquals(SplitWeight.rawValueSum(result.getAssignments().get(workerNode), Split::getSplitWeight), weightLimitPerNode);
+
+        // Mark all splits as running
+        task.addSplits(ImmutableMultimap.<PlanNodeId, Split>builder()
+                .putAll(new PlanNodeId("sourceId"), result.getAssignments().get(workerNode))
+                .build());
+        task.startSplits(result.getAssignments().get(workerNode).size());
+
+        // Per task pending splits limit met
+        Set<Split> remainingSplits = Sets.difference(splits, ImmutableSet.copyOf(result.getAssignments().get(workerNode)));
+        SplitPlacementResult secondResults = nodeSelector.computeAssignments(remainingSplits, ImmutableList.of(task));
+        assertEquals(secondResults.getAssignments().get(workerNode).size(), standardPendingSplitsPerTask * 2);
+        assertEquals(SplitWeight.rawValueSum(secondResults.getAssignments().get(workerNode), Split::getSplitWeight), weightLimitPendingPerTask);
+        task.addSplits(ImmutableMultimap.<PlanNodeId, Split>builder()
+                .putAll(new PlanNodeId("sourceId"), secondResults.getAssignments().get(workerNode))
+                .build());
+
+        assertEquals(
+                nodeTaskMap.getPartitionedSplitsOnNode(workerNode),
+                // 2x fully loaded standard count, full weight limit reached
+                PartitionedSplitsInfo.forSplitCountAndWeightSum(fullyLoadedStandardSplitCount * 2, fullyLoadedStandardSplitWeight));
+
+        // No more splits assigned when full
+        SplitPlacementResult resultWhenFull = nodeSelector.computeAssignments(ImmutableSet.of(new Split(CONNECTOR_ID, transactionHandle, new TestSplitRemote())), ImmutableList.of(task));
+        assertTrue(resultWhenFull.getAssignments().isEmpty());
     }
 
     @Test
@@ -697,7 +1098,7 @@ public class TestNodeScheduler
                 .setIncludeCoordinator(false)
                 .setMaxPendingSplitsPerTask(10);
 
-        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap);
+        NodeScheduler nodeScheduler = new NodeScheduler(new LegacyNetworkTopology(), nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
         NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 2);
 
         Set<Split> splits = new HashSet<>();
@@ -735,7 +1136,7 @@ public class TestNodeScheduler
 
         LegacyNetworkTopology networkTopology = new LegacyNetworkTopology();
         // refresh interval is 1 nanosecond
-        NodeScheduler nodeScheduler = new NodeScheduler(new NetworkLocationCache(networkTopology), networkTopology, nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, Duration.valueOf("0s"));
+        NodeScheduler nodeScheduler = new NodeScheduler(new NetworkLocationCache(networkTopology), networkTopology, nodeManager, new NodeSelectionStats(), nodeSchedulerConfig, nodeTaskMap, Duration.valueOf("0s"), new ThrowingNodeTtlFetcherManager(), new NoOpQueryManager(), new SimpleTtlNodeSelectorConfig());
         NodeSelector nodeSelector = nodeScheduler.createNodeSelector(session, CONNECTOR_ID, 2);
 
         Set<Split> splits = new HashSet<>();
@@ -785,9 +1186,34 @@ public class TestNodeScheduler
                 .build();
     }
 
+    private static Session sessionWithTtlAwareSchedulingStrategyAndEstimatedExecutionTime(Duration estimatedExecutionTime)
+    {
+        return TestingSession.testSessionBuilder()
+                .setSystemProperty(RESOURCE_AWARE_SCHEDULING_STRATEGY, NodeSchedulerConfig.ResourceAwareSchedulingStrategy.TTL.name())
+                .setResourceEstimates(new Session.ResourceEstimateBuilder().setExecutionTime(estimatedExecutionTime).build())
+                .build();
+    }
+
+    private static PartitionedSplitsInfo standardWeightSplitsInfo(int splitCount)
+    {
+        return PartitionedSplitsInfo.forSplitCountAndWeightSum(splitCount, SplitWeight.rawValueForStandardSplitCount(splitCount));
+    }
+
     private static class TestSplitLocal
             implements ConnectorSplit
     {
+        private final SplitWeight splitWeight;
+
+        public TestSplitLocal()
+        {
+            this(SplitWeight.standard());
+        }
+
+        public TestSplitLocal(SplitWeight splitWeight)
+        {
+            this.splitWeight = requireNonNull(splitWeight, "splitWeight is null");
+        }
+
         @Override
         public NodeSelectionStrategy getNodeSelectionStrategy()
         {
@@ -795,7 +1221,7 @@ public class TestNodeScheduler
         }
 
         @Override
-        public List<HostAddress> getPreferredNodes(List<HostAddress> sortedCandidates)
+        public List<HostAddress> getPreferredNodes(NodeProvider nodeProvider)
         {
             return ImmutableList.of(HostAddress.fromString("127.0.0.1:11"));
         }
@@ -805,21 +1231,39 @@ public class TestNodeScheduler
         {
             return this;
         }
+
+        @Override
+        public SplitWeight getSplitWeight()
+        {
+            return splitWeight;
+        }
     }
 
     private static class TestSplitRemote
             implements ConnectorSplit
     {
         private final List<HostAddress> hosts;
+        private final SplitWeight splitWeight;
 
         public TestSplitRemote()
         {
-            this(HostAddress.fromString("127.0.0.1:" + ThreadLocalRandom.current().nextInt(5000)));
+            this(SplitWeight.standard());
+        }
+
+        public TestSplitRemote(SplitWeight splitWeight)
+        {
+            this(HostAddress.fromString("127.0.0.1:" + ThreadLocalRandom.current().nextInt(5000)), splitWeight);
         }
 
         public TestSplitRemote(HostAddress host)
         {
+            this(host, SplitWeight.standard());
+        }
+
+        public TestSplitRemote(HostAddress host, SplitWeight splitWeight)
+        {
             this.hosts = ImmutableList.of(requireNonNull(host, "host is null"));
+            this.splitWeight = requireNonNull(splitWeight, "splitWeight is null");
         }
 
         @Override
@@ -829,7 +1273,7 @@ public class TestNodeScheduler
         }
 
         @Override
-        public List<HostAddress> getPreferredNodes(List<HostAddress> sortedCandidates)
+        public List<HostAddress> getPreferredNodes(NodeProvider nodeProvider)
         {
             return hosts;
         }
@@ -838,6 +1282,12 @@ public class TestNodeScheduler
         public Object getInfo()
         {
             return this;
+        }
+
+        @Override
+        public SplitWeight getSplitWeight()
+        {
+            return splitWeight;
         }
     }
 
@@ -853,15 +1303,40 @@ public class TestNodeScheduler
         }
 
         @Override
+        public Object getSplitIdentifier()
+        {
+            return scheduleIdentifierId;
+        }
+
+        @Override
         public NodeSelectionStrategy getNodeSelectionStrategy()
         {
             return NodeSelectionStrategy.SOFT_AFFINITY;
         }
 
         @Override
-        public List<HostAddress> getPreferredNodes(List<HostAddress> sortedCandidates)
+        public List<HostAddress> getPreferredNodes(NodeProvider nodeProvider)
         {
-            return ImmutableList.of(sortedCandidates.get(scheduleIdentifierId % sortedCandidates.size()));
+            return nodeProvider.get(format("split%d", scheduleIdentifierId), 1);
+        }
+
+        @Override
+        public boolean equals(Object obj)
+        {
+            if (this == obj) {
+                return true;
+            }
+            if ((obj == null) || (getClass() != obj.getClass())) {
+                return false;
+            }
+            TestAffinitySplitRemote o = (TestAffinitySplitRemote) obj;
+            return scheduleIdentifierId == o.scheduleIdentifierId;
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(scheduleIdentifierId);
         }
     }
 
@@ -880,9 +1355,9 @@ public class TestNodeScheduler
         }
 
         @Override
-        public List<HostAddress> getPreferredNodes(List<HostAddress> sortedCandidates)
+        public List<HostAddress> getPreferredNodes(NodeProvider nodeProvider)
         {
-            return ImmutableList.of(sortedCandidates.get(new Random().nextInt(sortedCandidates.size())));
+            return nodeProvider.get(String.valueOf(new Random().nextInt()), 1);
         }
     }
 

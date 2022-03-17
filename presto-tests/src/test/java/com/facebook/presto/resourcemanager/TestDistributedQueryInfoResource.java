@@ -57,8 +57,8 @@ public class TestDistributedQueryInfoResource
     {
         client = new JettyHttpClient();
         DistributedQueryRunner runner = createQueryRunner(ImmutableMap.of("query.client.timeout", "20s"), COORDINATOR_COUNT);
-        coordinator1 = runner.getCoordinators().get(0);
-        coordinator2 = runner.getCoordinators().get(1);
+        coordinator1 = runner.getCoordinator(0);
+        coordinator2 = runner.getCoordinator(1);
         Optional<TestingPrestoServer> resourceManager = runner.getResourceManager();
         checkState(resourceManager.isPresent(), "resource manager not present");
         this.resourceManager = resourceManager.get();
@@ -83,7 +83,7 @@ public class TestDistributedQueryInfoResource
         client = null;
     }
 
-    @Test(timeOut = 220_000)
+    @Test(timeOut = 220_000, enabled = false)
     public void testGetAllQueryInfo()
             throws Exception
     {
@@ -102,10 +102,10 @@ public class TestDistributedQueryInfoResource
         }
     }
 
-    private void waitUntilCoordinatorsDiscoveredHealthyInRM(long timeoutInMilis)
+    private void waitUntilCoordinatorsDiscoveredHealthyInRM(long timeoutInMillis)
             throws TimeoutException, InterruptedException
     {
-        long deadline = System.currentTimeMillis() + timeoutInMilis;
+        long deadline = System.currentTimeMillis() + timeoutInMillis;
         while (System.currentTimeMillis() < deadline) {
             AllNodes allNodes = this.resourceManager.refreshNodes();
             if (allNodes.getActiveCoordinators().size() == COORDINATOR_COUNT) {
@@ -113,6 +113,6 @@ public class TestDistributedQueryInfoResource
             }
             sleep(100);
         }
-        throw new TimeoutException(format("one of the nodes is still missing after: %s ms", timeoutInMilis));
+        throw new TimeoutException(format("one of the nodes is still missing after: %s ms", timeoutInMillis));
     }
 }

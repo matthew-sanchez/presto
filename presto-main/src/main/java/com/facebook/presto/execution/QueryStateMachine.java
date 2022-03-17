@@ -97,6 +97,7 @@ public class QueryStateMachine
 
     private final QueryId queryId;
     private final String query;
+    private final Optional<String> preparedQuery;
     private final Session session;
     private final URI self;
     private final Optional<QueryType> queryType;
@@ -146,6 +147,7 @@ public class QueryStateMachine
     private final AtomicReference<Set<Input>> inputs = new AtomicReference<>(ImmutableSet.of());
     private final AtomicReference<Optional<Output>> output = new AtomicReference<>(Optional.empty());
     private final StateMachine<Optional<QueryInfo>> finalQueryInfo;
+    private final AtomicReference<Optional<String>> expandedQuery = new AtomicReference<>(Optional.empty());
 
     private final Map<SqlFunctionId, SqlInvokedFunction> addedSessionFunctions = new ConcurrentHashMap<>();
     private final Set<SqlFunctionId> removedSessionFunctions = Sets.newConcurrentHashSet();
@@ -154,6 +156,7 @@ public class QueryStateMachine
 
     private QueryStateMachine(
             String query,
+            Optional<String> preparedQuery,
             Session session,
             URI self,
             ResourceGroupId resourceGroup,
@@ -165,6 +168,7 @@ public class QueryStateMachine
             WarningCollector warningCollector)
     {
         this.query = requireNonNull(query, "query is null");
+        this.preparedQuery = requireNonNull(preparedQuery, "preparedQuery is null");
         this.session = requireNonNull(session, "session is null");
         this.queryId = session.getQueryId();
         this.self = requireNonNull(self, "self is null");
@@ -185,6 +189,7 @@ public class QueryStateMachine
      */
     public static QueryStateMachine begin(
             String query,
+            Optional<String> preparedQuery,
             Session session,
             URI self,
             ResourceGroupId resourceGroup,
@@ -198,6 +203,7 @@ public class QueryStateMachine
     {
         return beginWithTicker(
                 query,
+                preparedQuery,
                 session,
                 self,
                 resourceGroup,
@@ -213,6 +219,7 @@ public class QueryStateMachine
 
     static QueryStateMachine beginWithTicker(
             String query,
+            Optional<String> preparedQuery,
             Session session,
             URI self,
             ResourceGroupId resourceGroup,
@@ -234,6 +241,7 @@ public class QueryStateMachine
 
         QueryStateMachine queryStateMachine = new QueryStateMachine(
                 query,
+                preparedQuery,
                 session,
                 self,
                 resourceGroup,
@@ -349,6 +357,7 @@ public class QueryStateMachine
                 queryStateTimer.getElapsedTime(),
                 queryStateTimer.getExecutionTime(),
 
+                getCurrentRunningTaskCount(),
                 getPeakRunningTaskCount(),
 
                 stageStats.getTotalDrivers(),
@@ -390,7 +399,8 @@ public class QueryStateMachine
                 queryStats,
                 failureCause.get(),
                 queryType,
-                warningCollector.getWarnings());
+                warningCollector.getWarnings(),
+                preparedQuery);
     }
 
     public QueryInfo getQueryInfo(Optional<StageInfo> rootStage)
@@ -436,6 +446,8 @@ public class QueryStateMachine
                 self,
                 outputManager.getQueryOutputInfo().map(QueryOutputInfo::getColumnNames).orElse(ImmutableList.of()),
                 query,
+                expandedQuery.get(),
+                preparedQuery,
                 queryStats,
                 Optional.ofNullable(setCatalog.get()),
                 Optional.ofNullable(setSchema.get()),
@@ -472,7 +484,8 @@ public class QueryStateMachine
                 succinctBytes(getPeakTotalMemoryInBytes()),
                 succinctBytes(getPeakTaskUserMemory()),
                 succinctBytes(getPeakTaskTotalMemory()),
-                succinctBytes(getPeakNodeTotalMemory()));
+                succinctBytes(getPeakNodeTotalMemory()),
+                session.getRuntimeStats());
     }
 
     public VersionedMemoryPoolId getMemoryPool()
@@ -624,6 +637,11 @@ public class QueryStateMachine
     public void setUpdateType(String updateType)
     {
         this.updateType.set(updateType);
+    }
+
+    public void setExpandedQuery(Optional<String> expandedQuery)
+    {
+        this.expandedQuery.set(expandedQuery);
     }
 
     public QueryState getQueryState()
@@ -922,6 +940,8 @@ public class QueryStateMachine
                 queryInfo.getSelf(),
                 queryInfo.getFieldNames(),
                 queryInfo.getQuery(),
+                queryInfo.getExpandedQuery(),
+                queryInfo.getPreparedQuery(),
                 pruneQueryStats(queryInfo.getQueryStats()),
                 queryInfo.getSetCatalog(),
                 queryInfo.getSetSchema(),

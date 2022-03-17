@@ -15,10 +15,11 @@ package com.facebook.presto.sql.analyzer;
 
 import com.facebook.presto.Session;
 import com.facebook.presto.common.QualifiedObjectName;
+import com.facebook.presto.common.Subfield;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.security.AccessControl;
+import com.facebook.presto.security.AllowAllAccessControl;
 import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.security.Identity;
@@ -34,6 +35,7 @@ import com.facebook.presto.sql.tree.Node;
 import com.facebook.presto.sql.tree.NodeRef;
 import com.facebook.presto.sql.tree.Offset;
 import com.facebook.presto.sql.tree.OrderBy;
+import com.facebook.presto.sql.tree.Parameter;
 import com.facebook.presto.sql.tree.QuantifiedComparisonExpression;
 import com.facebook.presto.sql.tree.Query;
 import com.facebook.presto.sql.tree.QuerySpecification;
@@ -65,7 +67,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.SystemSessionProperties.isCheckAccessControlOnUtilizedColumnsOnly;
-import static com.facebook.presto.metadata.MetadataUtil.toSchemaTableName;
+import static com.facebook.presto.SystemSessionProperties.isCheckAccessControlWithSubfields;
 import static com.facebook.presto.sql.analyzer.Analysis.MaterializedViewAnalysisState.NOT_VISITED;
 import static com.facebook.presto.sql.analyzer.Analysis.MaterializedViewAnalysisState.VISITED;
 import static com.facebook.presto.sql.analyzer.Analysis.MaterializedViewAnalysisState.VISITING;
@@ -73,6 +75,7 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.collect.Multimaps.forMap;
 import static com.google.common.collect.Multimaps.unmodifiableMultimap;
 import static java.lang.String.format;
@@ -87,7 +90,7 @@ public class Analysis
 {
     @Nullable
     private final Statement root;
-    private final List<Expression> parameters;
+    private final Map<NodeRef<Parameter>, Expression> parameters;
     private String updateType;
 
     private final Map<NodeRef<Table>, Query> namedQueries = new LinkedHashMap<>();
@@ -98,6 +101,7 @@ public class Analysis
     // a map of users to the columns per table that they access
     private final Map<AccessControlInfo, Map<QualifiedObjectName, Set<String>>> tableColumnReferences = new LinkedHashMap<>();
     private final Map<AccessControlInfo, Map<QualifiedObjectName, Set<String>>> utilizedTableColumnReferences = new LinkedHashMap<>();
+    private final Map<AccessControlInfo, Map<QualifiedObjectName, Set<Subfield>>> tableColumnAndSubfieldReferences = new LinkedHashMap<>();
 
     private final Map<NodeRef<QuerySpecification>, List<FunctionCall>> aggregates = new LinkedHashMap<>();
     private final Map<NodeRef<OrderBy>, List<Expression>> orderByAggregates = new LinkedHashMap<>();
@@ -160,12 +164,14 @@ public class Analysis
     // for materialized view analysis state detection, state is used to identify if materialized view has been expanded or in-process.
     private final Map<Table, MaterializedViewAnalysisState> materializedViewAnalysisStateMap = new HashMap<>();
 
-    public Analysis(@Nullable Statement root, List<Expression> parameters, boolean isDescribe)
-    {
-        requireNonNull(parameters);
+    private final Map<QualifiedObjectName, String> materializedViews = new LinkedHashMap<>();
 
+    private Optional<String> expandedQuery = Optional.empty();
+
+    public Analysis(@Nullable Statement root, Map<NodeRef<Parameter>, Expression> parameters, boolean isDescribe)
+    {
         this.root = root;
-        this.parameters = ImmutableList.copyOf(requireNonNull(parameters, "parameters is null"));
+        this.parameters = ImmutableMap.copyOf(requireNonNull(parameters, "parameterMap is null"));
         this.isDescribe = isDescribe;
     }
 
@@ -659,7 +665,7 @@ public class Analysis
         tablesForView.pop();
     }
 
-    public void registerMaterializedViewForAnalysis(Table materializedView)
+    public void registerMaterializedViewForAnalysis(QualifiedObjectName materializedViewName, Table materializedView, String materializedViewSql)
     {
         requireNonNull(materializedView, "materializedView is null");
         if (materializedViewAnalysisStateMap.containsKey(materializedView)) {
@@ -668,6 +674,8 @@ public class Analysis
         else {
             materializedViewAnalysisStateMap.put(materializedView, VISITING);
         }
+
+        materializedViews.put(materializedViewName, materializedViewSql);
     }
 
     public void unregisterMaterializedViewForAnalysis(Table materializedView)
@@ -737,7 +745,7 @@ public class Analysis
                 .orElse(emptyList());
     }
 
-    public List<Expression> getParameters()
+    public Map<NodeRef<Parameter>, Expression> getParameters()
     {
         return parameters;
     }
@@ -757,18 +765,23 @@ public class Analysis
         return joinUsing.get(NodeRef.of(node));
     }
 
-    public void addTableColumnReferences(AccessControl accessControl, Identity identity, Multimap<QualifiedObjectName, String> tableColumnMap)
+    public void addTableColumnAndSubfieldReferences(AccessControl accessControl, Identity identity, Multimap<QualifiedObjectName, Subfield> tableColumnMap)
     {
         AccessControlInfo accessControlInfo = new AccessControlInfo(accessControl, identity);
-        Map<QualifiedObjectName, Set<String>> references = tableColumnReferences.computeIfAbsent(accessControlInfo, k -> new LinkedHashMap<>());
+        Map<QualifiedObjectName, Set<String>> columnReferences = tableColumnReferences.computeIfAbsent(accessControlInfo, k -> new LinkedHashMap<>());
         tableColumnMap.asMap()
-                .forEach((key, value) -> references.computeIfAbsent(key, k -> new HashSet<>()).addAll(value));
+                .forEach((key, value) -> columnReferences.computeIfAbsent(key, k -> new HashSet<>()).addAll(value.stream().map(Subfield::getRootName).collect(toImmutableSet())));
+
+        Map<QualifiedObjectName, Set<Subfield>> columnAndSubfieldReferences = tableColumnAndSubfieldReferences.computeIfAbsent(accessControlInfo, k -> new LinkedHashMap<>());
+        tableColumnMap.asMap()
+                .forEach((key, value) -> columnAndSubfieldReferences.computeIfAbsent(key, k -> new HashSet<>()).addAll(value));
     }
 
     public void addEmptyColumnReferencesForTable(AccessControl accessControl, Identity identity, QualifiedObjectName table)
     {
         AccessControlInfo accessControlInfo = new AccessControlInfo(accessControl, identity);
         tableColumnReferences.computeIfAbsent(accessControlInfo, k -> new LinkedHashMap<>()).computeIfAbsent(table, k -> new HashSet<>());
+        tableColumnAndSubfieldReferences.computeIfAbsent(accessControlInfo, k -> new LinkedHashMap<>()).computeIfAbsent(table, k -> new HashSet<>());
     }
 
     public Map<AccessControlInfo, Map<QualifiedObjectName, Set<String>>> getTableColumnReferences()
@@ -776,9 +789,9 @@ public class Analysis
         return tableColumnReferences;
     }
 
-    public void addUtilizedTableColumnReferences(AccessControlInfo accessControlInfo, Map<QualifiedObjectName, Set<String>> utilizedTableColumms)
+    public void addUtilizedTableColumnReferences(AccessControlInfo accessControlInfo, Map<QualifiedObjectName, Set<String>> utilizedTableColumns)
     {
-        utilizedTableColumnReferences.put(accessControlInfo, utilizedTableColumms);
+        utilizedTableColumnReferences.put(accessControlInfo, utilizedTableColumns);
     }
 
     public Map<AccessControlInfo, Map<QualifiedObjectName, Set<String>>> getUtilizedTableColumnReferences()
@@ -786,9 +799,76 @@ public class Analysis
         return ImmutableMap.copyOf(utilizedTableColumnReferences);
     }
 
-    public Map<AccessControlInfo, Map<QualifiedObjectName, Set<String>>> getTableColumnReferencesForAccessControl(Session session)
+    public Map<AccessControlInfo, Map<QualifiedObjectName, Set<Subfield>>> getTableColumnAndSubfieldReferencesForAccessControl(Session session)
     {
-        return isCheckAccessControlOnUtilizedColumnsOnly(session) ? utilizedTableColumnReferences : tableColumnReferences;
+        Map<AccessControlInfo, Map<QualifiedObjectName, Set<Subfield>>> references;
+        if (!isCheckAccessControlWithSubfields(session)) {
+            references = (isCheckAccessControlOnUtilizedColumnsOnly(session) ? utilizedTableColumnReferences : tableColumnReferences).entrySet().stream()
+                    .collect(toImmutableMap(
+                            Map.Entry::getKey,
+                            accessControlEntry -> accessControlEntry.getValue().entrySet().stream().collect(toImmutableMap(
+                                    Map.Entry::getKey,
+                                    tableEntry -> tableEntry.getValue().stream().map(Subfield::new).collect(toImmutableSet())))));
+        }
+        else if (!isCheckAccessControlOnUtilizedColumnsOnly(session)) {
+            references = tableColumnAndSubfieldReferences;
+        }
+        else {
+            // TODO: Properly support utilized column check. Currently, we prune whole columns, if they are not utilized.
+            // We need to generalize it and exclude unutilized subfield references independently.
+            references = tableColumnAndSubfieldReferences.entrySet().stream()
+                    .collect(toImmutableMap(
+                            Map.Entry::getKey, accessControlEntry ->
+                                    accessControlEntry.getValue().entrySet().stream().collect(toImmutableMap(
+                                            Map.Entry::getKey, tableEntry -> tableEntry.getValue().stream().filter(
+                                                    column -> {
+                                                        Map<QualifiedObjectName, Set<String>> utilizedTableReferences = utilizedTableColumnReferences.get(accessControlEntry.getKey());
+                                                        if (utilizedTableReferences == null) {
+                                                            return false;
+                                                        }
+                                                        Set<String> utilizedColumns = utilizedTableReferences.get(tableEntry.getKey());
+                                                        return utilizedColumns != null && utilizedColumns.contains(column.getRootName());
+                                                    })
+                                                    .collect(toImmutableSet())))));
+        }
+        return buildMaterializedViewAccessControl(references);
+    }
+
+    /**
+     * For a query on materialized view, only check the actual required access controls for its base tables. For the materialized view,
+     * will not check access control by replacing with AllowAllAccessControl.
+     **/
+    private Map<AccessControlInfo, Map<QualifiedObjectName, Set<Subfield>>> buildMaterializedViewAccessControl(Map<AccessControlInfo, Map<QualifiedObjectName, Set<Subfield>>> tableColumnReferences)
+    {
+        if (!(getStatement() instanceof Query) || materializedViews.isEmpty()) {
+            return tableColumnReferences;
+        }
+
+        Map<AccessControlInfo, Map<QualifiedObjectName, Set<Subfield>>> newTableColumnReferences = new LinkedHashMap<>();
+
+        tableColumnReferences.forEach((accessControlInfo, references) -> {
+            AccessControlInfo allowAllAccessControlInfo = new AccessControlInfo(new AllowAllAccessControl(), accessControlInfo.getIdentity());
+            Map<QualifiedObjectName, Set<Subfield>> newAllowAllReferences = newTableColumnReferences.getOrDefault(allowAllAccessControlInfo, new LinkedHashMap<>());
+
+            Map<QualifiedObjectName, Set<Subfield>> newOtherReferences = new LinkedHashMap<>();
+
+            references.forEach((table, columns) -> {
+                if (materializedViews.containsKey(table)) {
+                    newAllowAllReferences.computeIfAbsent(table, key -> new HashSet<>()).addAll(columns);
+                }
+                else {
+                    newOtherReferences.put(table, columns);
+                }
+            });
+            if (!newAllowAllReferences.isEmpty()) {
+                newTableColumnReferences.put(allowAllAccessControlInfo, newAllowAllReferences);
+            }
+            if (!newOtherReferences.isEmpty()) {
+                newTableColumnReferences.put(accessControlInfo, newOtherReferences);
+            }
+        });
+
+        return newTableColumnReferences;
     }
 
     public void markRedundantOrderBy(OrderBy orderBy)
@@ -801,13 +881,14 @@ public class Analysis
         return redundantOrderBy.contains(NodeRef.of(orderBy));
     }
 
-    public Map<String, Map<SchemaTableName, String>> getOriginalColumnMapping(Node node)
+    public void setExpandedQuery(String expandedQuery)
     {
-        return getOutputDescriptor(node).getVisibleFields().stream()
-                .filter(field -> field.getOriginTable().isPresent() && field.getOriginColumnName().isPresent())
-                .collect(toImmutableMap(
-                        field -> field.getName().get(),
-                        field -> ImmutableMap.of(toSchemaTableName(field.getOriginTable().get()), field.getOriginColumnName().get())));
+        this.expandedQuery = Optional.of(expandedQuery);
+    }
+
+    public Optional<String> getExpandedQuery()
+    {
+        return expandedQuery;
     }
 
     @Immutable

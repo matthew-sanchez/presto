@@ -49,6 +49,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.IntStream;
 
+import static com.facebook.presto.SystemSessionProperties.ENABLE_INTERMEDIATE_AGGREGATIONS;
+import static com.facebook.presto.SystemSessionProperties.HASH_BASED_DISTINCT_LIMIT_ENABLED;
+import static com.facebook.presto.SystemSessionProperties.KEY_BASED_SAMPLING_ENABLED;
+import static com.facebook.presto.SystemSessionProperties.KEY_BASED_SAMPLING_FUNCTION;
+import static com.facebook.presto.SystemSessionProperties.KEY_BASED_SAMPLING_PERCENTAGE;
 import static com.facebook.presto.SystemSessionProperties.OFFSET_CLAUSE_ENABLED;
 import static com.facebook.presto.SystemSessionProperties.OPTIMIZE_JOINS_WITH_EMPTY_SOURCES;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
@@ -795,6 +800,8 @@ public abstract class AbstractTestQueries
                         "FROM (VALUES (1, ARRAY['a']), (1, ARRAY['b']), (1, ARRAY['c']), (2, ARRAY['d']), (2, ARRAY['e']), (3, ARRAY['f'])) AS t(x, y) " +
                         "GROUP BY x",
                 "VALUES (1, 'abcx'), (2, 'dex'), (3, 'fx')");
+
+        assertQuery("SELECT REDUCE_AGG((x,y), (0,0), (x, y)->(x[1],y[1]), (x,y)->(x[1],y[1]))[1] from (select 1 x, 2 y)", "select 0");
     }
 
     @Test
@@ -839,7 +846,7 @@ public abstract class AbstractTestQueries
                         "SELECT * FROM a",
                 "VALUES (1.1, 2), (sin(3.3), 2+2)");
 
-        // implicit coersions
+        // implicit coercions
         assertQuery("VALUES 1, 2.2, 3, 4.4");
         assertQuery("VALUES (1, 2), (3.3, 4.4)");
         assertQuery("VALUES true, 1.0 in (1, 2, 3)");
@@ -958,16 +965,34 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testDistinctLimitWithHashBasedDistinctLimitEnabled()
+    {
+        Session session = Session.builder(getSession())
+                .setSystemProperty(HASH_BASED_DISTINCT_LIMIT_ENABLED, "true")
+                .build();
+        testDistinctLimitInternal(session);
+    }
+
+    @Test
     public void testDistinctLimit()
     {
-        assertQuery("" +
+        testDistinctLimitInternal(getSession());
+    }
+
+    public void testDistinctLimitInternal(Session session)
+    {
+        assertQuery(session,
                 "SELECT DISTINCT orderstatus, custkey " +
                 "FROM (SELECT orderstatus, custkey FROM orders ORDER BY orderkey LIMIT 10) " +
                 "LIMIT 10");
-        assertQuery("SELECT COUNT(*) FROM (SELECT DISTINCT orderstatus, custkey FROM orders LIMIT 10)");
-        assertQuery("SELECT DISTINCT custkey, orderstatus FROM orders WHERE custkey = 1268 LIMIT 2");
+        assertQuery(session, "SELECT COUNT(*) FROM (SELECT DISTINCT orderstatus, custkey FROM orders LIMIT 10)");
+        assertQuery(session, "SELECT DISTINCT custkey, orderstatus FROM orders WHERE custkey = 1268 LIMIT 2");
+        assertQuery(session, "SELECT DISTINCT custkey, orderstatus FROM orders WHERE custkey = 1268 LIMIT 10000");
+        assertQuery(session, "SELECT DISTINCT custkey, orderstatus FROM orders WHERE custkey = 1268 LIMIT 15000");
+        assertQuerySucceeds(session, "SELECT DISTINCT custkey FROM orders LIMIT 2");
+        assertQuerySucceeds(session, "SELECT DISTINCT custkey FROM orders LIMIT 10000");
 
-        assertQuery("" +
+        assertQuery(session, "" +
                         "SELECT DISTINCT x " +
                         "FROM (VALUES 1) t(x) JOIN (VALUES 10, 20) u(a) ON t.x < u.a " +
                         "LIMIT 100",
@@ -2342,7 +2367,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN ", query, LOGICAL));
     }
 
     @Test
@@ -2350,7 +2375,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (FORMAT GRAPHVIZ) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getGraphvizExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getGraphvizExplainPlan("EXPLAIN (FORMAT GRAPHVIZ) ", query, LOGICAL));
     }
 
     @Test
@@ -2358,7 +2383,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE LOGICAL) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN (TYPE LOGICAL) ", query, LOGICAL));
     }
 
     @Test
@@ -2366,7 +2391,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE IO) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, IO));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN (TYPE IO) ", query, IO));
     }
 
     @Test
@@ -2374,7 +2399,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE LOGICAL, FORMAT TEXT) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN (TYPE LOGICAL, FORMAT TEXT) ", query, LOGICAL));
     }
 
     @Test
@@ -2382,7 +2407,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE LOGICAL, FORMAT GRAPHVIZ) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getGraphvizExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getGraphvizExplainPlan("EXPLAIN (TYPE LOGICAL, FORMAT GRAPHVIZ) ", query, LOGICAL));
     }
 
     @Test
@@ -2390,7 +2415,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE LOGICAL, FORMAT JSON) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getJsonExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getJsonExplainPlan("EXPLAIN (TYPE LOGICAL, FORMAT JSON) ", query, LOGICAL));
     }
 
     @Test
@@ -2398,7 +2423,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE DISTRIBUTED) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, DISTRIBUTED));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN (TYPE DISTRIBUTED) ", query, DISTRIBUTED));
     }
 
     @Test
@@ -2406,7 +2431,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, DISTRIBUTED));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN (TYPE DISTRIBUTED, FORMAT TEXT) ", query, DISTRIBUTED));
     }
 
     @Test
@@ -2414,7 +2439,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE DISTRIBUTED, FORMAT GRAPHVIZ) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getGraphvizExplainPlan(query, DISTRIBUTED));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getGraphvizExplainPlan("EXPLAIN (TYPE DISTRIBUTED, FORMAT GRAPHVIZ) ", query, DISTRIBUTED));
     }
 
     @Test
@@ -2422,7 +2447,7 @@ public abstract class AbstractTestQueries
     {
         String query = "SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN (TYPE DISTRIBUTED, FORMAT JSON) " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getJsonExplainPlan(query, DISTRIBUTED));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getJsonExplainPlan("EXPLAIN (TYPE DISTRIBUTED, FORMAT JSON) ", query, DISTRIBUTED));
     }
 
     @Test
@@ -2443,7 +2468,7 @@ public abstract class AbstractTestQueries
     {
         String query = "EXPLAIN SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN ", query, LOGICAL));
     }
 
     @Test
@@ -2451,7 +2476,7 @@ public abstract class AbstractTestQueries
     {
         String query = "EXPLAIN ANALYZE SELECT * FROM orders";
         MaterializedResult result = computeActual("EXPLAIN " + query);
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan(query, LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("EXPLAIN ", query, LOGICAL));
     }
 
     @Test
@@ -2493,7 +2518,7 @@ public abstract class AbstractTestQueries
                 .addPreparedStatement("my_query", "SELECT * FROM orders")
                 .build();
         MaterializedResult result = computeActual(session, "EXPLAIN (TYPE LOGICAL) EXECUTE my_query");
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("SELECT * FROM orders", LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("", "SELECT * FROM orders", LOGICAL));
     }
 
     @Test
@@ -2503,7 +2528,7 @@ public abstract class AbstractTestQueries
                 .addPreparedStatement("my_query", "SELECT * FROM orders WHERE orderkey < ?")
                 .build();
         MaterializedResult result = computeActual(session, "EXPLAIN (TYPE LOGICAL) EXECUTE my_query USING 7");
-        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("SELECT * FROM orders WHERE orderkey < 7", LOGICAL));
+        assertEquals(getOnlyElement(result.getOnlyColumnAsSet()), getExplainPlan("", "SELECT * FROM orders WHERE orderkey < 7", LOGICAL));
     }
 
     @Test
@@ -2645,7 +2670,7 @@ public abstract class AbstractTestQueries
 
         // Until we migrate all connectors to parametrized varchar we check two options
         assertTrue(actual.equals(expectedParametrizedVarchar) || actual.equals(expectedUnparametrizedVarchar),
-                format("%s does not matche neither of %s and %s", actual, expectedParametrizedVarchar, expectedUnparametrizedVarchar));
+                format("%s matches neither %s nor %s", actual, expectedParametrizedVarchar, expectedUnparametrizedVarchar));
     }
 
     @Test
@@ -2826,7 +2851,8 @@ public abstract class AbstractTestQueries
                         .build()),
                 getQueryRunner().getMetadata().getSessionPropertyManager(),
                 getSession().getPreparedStatements(),
-                ImmutableMap.of());
+                ImmutableMap.of(),
+                getSession().getTracer());
         MaterializedResult result = computeActual(session, "SHOW SESSION");
 
         ImmutableMap<String, MaterializedRow> properties = Maps.uniqueIndex(result.getMaterializedRows(), input -> {
@@ -2898,6 +2924,9 @@ public abstract class AbstractTestQueries
         assertQuery("SELECT TRY(2/0)", "SELECT null");
         assertQuery("SELECT COALESCE(TRY(2/0), 0)", "SELECT 0");
         assertQuery("SELECT TRY(ABS(-2))", "SELECT 2");
+
+        // test try with null
+        assertQuery("SELECT TRY(1 / x) FROM (SELECT NULL as x)", "SELECT NULL");
     }
 
     @Test
@@ -3954,7 +3983,7 @@ public abstract class AbstractTestQueries
     @Test
     public void testTwoCorrelatedExistsSubqueries()
     {
-        // This is simpliefied TPC-H q21
+        // This is simplified TPC-H q21
         assertQuery("SELECT\n" +
                         "  count(*) AS numwait\n" +
                         "FROM\n" +
@@ -4999,6 +5028,20 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testExecuteUsingWithWithClause()
+    {
+        String query = "WITH src AS (SELECT * FROM (VALUES (1, 4),(2, 5), (3, 6)) AS t(id1, id2) WHERE id2 = ?)" +
+                " SELECT * from src WHERE id1 between ? and ?";
+
+        Session session = Session.builder(getSession())
+                .addPreparedStatement("my_query", query)
+                .build();
+        assertQuery(session,
+                "EXECUTE my_query USING 6, 0, 10",
+                "VALUES (3, 6)");
+    }
+
+    @Test
     public void testExecuteNoSuchQuery()
     {
         assertQueryFails("EXECUTE my_query", "Prepared statement not found: my_query");
@@ -5783,5 +5826,122 @@ public abstract class AbstractTestQueries
         assertQuery("select concat('a', '','','', 'b', '', '', 'c', 'd', '', '', '', '')", "select 'abcd'");
         assertQuery("select concat('', '','','', '', '', '', '', '', '', '')", "select ''");
         assertQuery("select concat('', '','','', 'x', '', '', '', '', '', '')", "select 'x'");
+    }
+
+    @Test
+    public void testReduceAggWithNulls()
+    {
+        assertQueryFails("select reduce_agg(x, null, (x,y)->try(x+y), (x,y)->try(x+y)) from (select 1 union all select 10) T(x)", ".*REDUCE_AGG only supports non-NULL literal as the initial value.*");
+        assertQueryFails("select reduce_agg(x, cast(null as bigint), (x,y)->coalesce(x, 0)+coalesce(y, 0), (x,y)->coalesce(x, 0)+coalesce(y, 0)) from (values cast(10 as bigint),10)T(x)", ".*REDUCE_AGG only supports non-NULL literal as the initial value.*");
+
+        // here some reduce_aggs coalesce overflow/zero-divide errors to null in the input/combine functions
+        assertQuery("select reduce_agg(x, 0, (x,y)->try(1/x+1/y), (x,y)->try(1/x+1/y)) from ((select 0) union all select 10.) T(x)", "select null");
+        assertQuery("select reduce_agg(x, 0, (x, y)->try(x+y), (x, y)->try(x+y)) from (values 2817, 9223372036854775807) AS T(x)", "select null");
+        assertQuery("select reduce_agg(x, array[], (x, y)->array[element_at(x, 2)],  (x, y)->array[element_at(x, 2)]) from (select array[array[1]]) T(x)", "select array[null]");
+    }
+
+    @Test
+    public void testReduceAggWithMapZip()
+    {
+        Session sessionWithIntermediateAggEnabled = Session.builder(getSession())
+                .setSystemProperty(ENABLE_INTERMEDIATE_AGGREGATIONS, "true")
+                .build();
+        assertQuerySucceeds(sessionWithIntermediateAggEnabled, "select reduce_agg(x, map(), (s,x)->map_zip_with( s, x, (k1,v1,v2)->if(v1>v2,v1,v2)), (s,x)->map_zip_with( s, x, (k1,v1,v2)->if(v1>v2,v1,v2))) from (select map(array['k1', 'k2'], array[1e-2, 0.06]) x union all select map(array['k1', 'k2'], array[2e-05, 1e-2]) x)");
+    }
+
+    @Test
+    public void testReduceAggWithArrayConcat()
+    {
+        assertQuerySucceeds("select sum(cardinality(s)) from (SELECT REDUCE_AGG(x, cast(array[] as array<bigint>), (x,y)->x||sequence(1, y), (x,y)->x||y) s FROM (SELECT x FROM (SELECT 1) CROSS JOIN UNNEST(SEQUENCE(1, 7000)) T(x)) group by random(100))");
+        assertQuerySucceeds("select sum(cardinality(s)) from (SELECT REDUCE_AGG(x, cast(map() as map<bigint, bigint>), (x,y) -> map_concat(x, map(sequence(1, y), repeat(1, cast(y as int)))), (x,y)->map_concat(x,y)) s FROM (SELECT x FROM (SELECT 1) CROSS JOIN UNNEST(SEQUENCE(1, 7000)) T(x)) group by random(100))");
+    }
+
+    @Test
+    public void testDefaultSamplingPercent()
+    {
+        assertQuery("select key_sampling_percent('abc')", "select 0.56");
+    }
+
+    @Test
+    public void testKeyBasedSampling()
+    {
+        String[] queries = new String[] {
+                "select count(1) from orders join lineitem using(orderkey)",
+                "select count(1) from (select custkey, max(orderkey) from orders group by custkey)",
+                "select count_if(m >= 1) from (select max(orderkey) over(partition by custkey) m from orders)",
+                "select cast(m as bigint) from (select sum(totalprice) over(partition by custkey order by comment) m from orders order by 1 desc limit 1)",
+                "select count(1) from lineitem where orderkey in (select orderkey from orders where length(comment) > 7)",
+                "select count(1) from lineitem where orderkey not in (select orderkey from orders where length(comment) > 27)",
+                "select count(1) from (select distinct orderkey, custkey from orders)",
+        };
+
+        int[] unsampledResults = new int[] {60175, 1000, 15000, 5408941, 60175, 9256, 15000};
+        for (int i = 0; i < queries.length; i++) {
+            assertQuery(queries[i], "select " + unsampledResults[i]);
+        }
+
+        Session sessionWithKeyBasedSampling = Session.builder(getSession())
+                .setSystemProperty(KEY_BASED_SAMPLING_ENABLED, "true")
+                .setSystemProperty(KEY_BASED_SAMPLING_PERCENTAGE, "0.2")
+                .build();
+
+        int[] sampled20PercentResults = new int[] {37170, 616, 9189, 5408941, 37170, 5721, 9278};
+        for (int i = 0; i < queries.length; i++) {
+            assertQuery(sessionWithKeyBasedSampling, queries[i], "select " + sampled20PercentResults[i]);
+        }
+
+        sessionWithKeyBasedSampling = Session.builder(getSession())
+                .setSystemProperty(KEY_BASED_SAMPLING_ENABLED, "true")
+                .setSystemProperty(KEY_BASED_SAMPLING_PERCENTAGE, "0.1")
+                .build();
+
+        int[] sampled10PercentResults = new int[] {33649, 557, 8377, 4644937, 33649, 5098, 8397};
+        for (int i = 0; i < queries.length; i++) {
+            assertQuery(sessionWithKeyBasedSampling, queries[i], "select " + sampled10PercentResults[i]);
+        }
+    }
+
+    @Test
+    public void testKeyBasedSamplingFunctionError()
+    {
+        Session sessionWithKeyBasedSampling = Session.builder(getSession())
+                .setSystemProperty(KEY_BASED_SAMPLING_ENABLED, "true")
+                .setSystemProperty(KEY_BASED_SAMPLING_FUNCTION, "blah")
+                .build();
+
+        assertQueryFails(sessionWithKeyBasedSampling, "select count(1) from orders join lineitem using(orderkey)", "Sampling function: blah not cannot be resolved");
+    }
+
+    @Test
+    public void testSamplingJoinChain()
+    {
+        Session sessionWithKeyBasedSampling = Session.builder(getSession())
+                .setSystemProperty(KEY_BASED_SAMPLING_ENABLED, "true")
+                .build();
+        String query = "select count(1) FROM lineitem l left JOIN orders o ON l.orderkey = o.orderkey JOIN customer c ON o.custkey = c.custkey";
+
+        assertQuery(query, "select 60175");
+        assertQuery(sessionWithKeyBasedSampling, query, "select 16185");
+    }
+
+    @Test
+    public void testGroupByWithLambdaExpression()
+    {
+        assertQueryFails(
+                "SELECT reduce(a, 0, (s, x) -> x, s->s), count(*) FROM (VALUES (array[1]), (array[1, 2, 3]), (array[3])) t(a) GROUP BY reduce(a, 0, (s, x) -> x, s->s)",
+                "GROUP BY does not support lambda expressions, please use GROUP BY # instead");
+        assertQuery(
+                "SELECT reduce(a, 0, (s, x) -> x, s->s), count(*) FROM (VALUES (array[1]), (array[1, 2, 3]), (array[3])) t(a) GROUP BY 1",
+                "VALUES (3, 2), (1, 1)");
+    }
+
+    public void testSourceLocationInPlan()
+    {
+        MaterializedResult result = computeActual("explain(type distributed) select max(orderkey + 1) over(partition by custkey) m from orders");
+        assertEquals(result.getRowCount(), 1);
+        String plan = (String) result.getMaterializedRows().get(0).getField(0);
+        assertTrue(plan.contains("expr := (orderkey) + (BIGINT'1') (1:88)"));
+        assertTrue(plan.contains("m := max (1:34)"));
+        assertTrue(plan.contains("max := max(expr) RANGE UNBOUNDED_PRECEDING CURRENT_ROW (1:34)"));
     }
 }

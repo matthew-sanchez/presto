@@ -14,6 +14,9 @@
 package com.facebook.presto.tests;
 
 import com.facebook.airlift.discovery.server.testing.TestingDiscoveryServer;
+import com.facebook.airlift.http.client.HttpClient;
+import com.facebook.airlift.http.client.Request;
+import com.facebook.airlift.http.client.jetty.JettyHttpClient;
 import com.facebook.airlift.log.Logger;
 import com.facebook.airlift.testing.Assertions;
 import com.facebook.presto.Session;
@@ -30,6 +33,7 @@ import com.facebook.presto.metadata.SessionPropertyManager;
 import com.facebook.presto.server.BasicQueryInfo;
 import com.facebook.presto.server.testing.TestingPrestoServer;
 import com.facebook.presto.spi.ConnectorId;
+import com.facebook.presto.spi.NodeState;
 import com.facebook.presto.spi.Plugin;
 import com.facebook.presto.spi.QueryId;
 import com.facebook.presto.spi.WarningCollector;
@@ -71,6 +75,10 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
+import static com.facebook.airlift.http.client.JsonResponseHandler.createJsonResponseHandler;
+import static com.facebook.airlift.http.client.Request.Builder.prepareGet;
+import static com.facebook.airlift.json.JsonCodec.jsonCodec;
+import static com.facebook.presto.client.PrestoHeaders.PRESTO_USER;
 import static com.facebook.presto.testing.TestingSession.TESTING_CATALOG;
 import static com.facebook.presto.testing.TestingSession.createBogusTestingCatalog;
 import static com.facebook.presto.tests.AbstractTestQueries.TEST_CATALOG_PROPERTIES;
@@ -80,6 +88,7 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Throwables.throwIfUnchecked;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.airlift.units.Duration.nanosSince;
+import static java.lang.String.format;
 import static java.lang.System.nanoTime;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -90,15 +99,18 @@ public class DistributedQueryRunner
 {
     private static final Logger log = Logger.get(DistributedQueryRunner.class);
     private static final String ENVIRONMENT = "testing";
+    private static final String DEFAULT_USER = "user";
     private static final SqlParserOptions DEFAULT_SQL_PARSER_OPTIONS = new SqlParserOptions();
 
     private final TestingDiscoveryServer discoveryServer;
     private final List<TestingPrestoServer> coordinators;
+    private final int coordinatorCount;
     private final List<TestingPrestoServer> servers;
     private final List<Process> externalWorkers;
     private final List<Module> extraModules;
 
     private final Closer closer = Closer.create();
+    private final HttpClient client = new JettyHttpClient();
 
     private final List<TestingPrestoClient> prestoClients;
 
@@ -118,7 +130,7 @@ public class DistributedQueryRunner
     public DistributedQueryRunner(Session defaultSession, int nodeCount, Map<String, String> extraProperties)
             throws Exception
     {
-        this(false, defaultSession, nodeCount, 1, extraProperties, ImmutableMap.of(), DEFAULT_SQL_PARSER_OPTIONS, ENVIRONMENT, Optional.empty(), Optional.empty(), ImmutableList.of());
+        this(false, defaultSession, nodeCount, 1, extraProperties, ImmutableMap.of(), ImmutableMap.of(), DEFAULT_SQL_PARSER_OPTIONS, ENVIRONMENT, Optional.empty(), Optional.empty(), ImmutableList.of());
     }
 
     public static Builder builder(Session defaultSession)
@@ -133,6 +145,7 @@ public class DistributedQueryRunner
             int coordinatorCount,
             Map<String, String> extraProperties,
             Map<String, String> coordinatorProperties,
+            Map<String, String> resourceManagerProperties,
             SqlParserOptions parserOptions,
             String environment,
             Optional<Path> baseDataDir,
@@ -146,6 +159,7 @@ public class DistributedQueryRunner
         try {
             long start = nanoTime();
             discoveryServer = new TestingDiscoveryServer(environment);
+            this.coordinatorCount = coordinatorCount;
             closer.register(() -> closeUnchecked(discoveryServer));
             log.info("Created TestingDiscoveryServer in %s", nanosSince(start).convertToMostSuccinctTimeUnit());
             URI discoveryUrl = discoveryServer.getBaseUrl();
@@ -183,16 +197,16 @@ public class DistributedQueryRunner
             extraCoordinatorProperties.putAll(extraProperties);
             extraCoordinatorProperties.putAll(coordinatorProperties);
 
+            if (resourceManagerEnabled) {
+                resourceManager = Optional.of(closer.register(createTestingPrestoServer(discoveryUrl, true, true, false, resourceManagerProperties, parserOptions, environment, baseDataDir, extraModules)));
+                servers.add(resourceManager.get());
+            }
+
             for (int i = 0; i < coordinatorCount; i++) {
                 TestingPrestoServer coordinator = closer.register(createTestingPrestoServer(discoveryUrl, false, resourceManagerEnabled, true, extraCoordinatorProperties, parserOptions, environment, baseDataDir, extraModules));
                 servers.add(coordinator);
                 coordinators.add(coordinator);
                 extraCoordinatorProperties.remove("http-server.http.port");
-            }
-
-            if (resourceManagerEnabled) {
-                resourceManager = Optional.of(closer.register(createTestingPrestoServer(discoveryUrl, true, true, false, extraCoordinatorProperties, parserOptions, environment, baseDataDir, extraModules)));
-                servers.add(resourceManager.get());
             }
 
             this.servers = servers.build();
@@ -238,6 +252,36 @@ public class DistributedQueryRunner
             sessionPropertyManager.addSystemSessionProperties(TEST_SYSTEM_PROPERTIES);
             sessionPropertyManager.addConnectorSessionProperties(bogusTestingCatalog.getConnectorId(), TEST_CATALOG_PROPERTIES);
         }
+    }
+
+    public void waitForClusterToGetReady()
+            throws InterruptedException
+    {
+        for (int i = 0; i < coordinators.size(); i++) {
+            NodeState state = NodeState.INACTIVE;
+            while (state != NodeState.ACTIVE) {
+                MILLISECONDS.sleep(10);
+                state = getCoordinatorInfoState(i);
+            }
+        }
+
+        int availableCoordinators = 0;
+        while (availableCoordinators != coordinators.size()) {
+            MILLISECONDS.sleep(10);
+            availableCoordinators = getResourceManager().get().getNodeManager().getCoordinators().size();
+        }
+    }
+
+    private NodeState getCoordinatorInfoState(int coordinator)
+    {
+        URI uri = URI.create(getCoordinator(coordinator).getBaseUrl().toString() + "/v1/info/state");
+        Request request = prepareGet()
+                .setHeader(PRESTO_USER, DEFAULT_USER)
+                .setUri(uri)
+                .build();
+
+        NodeState state = client.execute(request, createJsonResponseHandler(jsonCodec(NodeState.class)));
+        return state;
     }
 
     private static TestingPrestoServer createTestingPrestoServer(URI discoveryUri, boolean resourceManager, boolean resourceManagerEnabled, boolean coordinator, Map<String, String> extraProperties, SqlParserOptions parserOptions, String environment, Optional<Path> baseDataDir, List<Module> extraModules)
@@ -370,6 +414,12 @@ public class DistributedQueryRunner
         return coordinators.get(0);
     }
 
+    public TestingPrestoServer getCoordinator(int coordinator)
+    {
+        checkState(coordinator < coordinators.size(), format("Expected coordinator index %d < %d", coordinator, coordinatorCount));
+        return coordinators.get(coordinator);
+    }
+
     public List<TestingPrestoServer> getCoordinators()
     {
         return coordinators;
@@ -380,6 +430,11 @@ public class DistributedQueryRunner
         return resourceManager;
     }
 
+    public List<TestingPrestoServer> getCoordinatorWorkers()
+    {
+        return getServers().stream().filter(server -> !server.isResourceManager()).collect(ImmutableList.toImmutableList());
+    }
+
     public List<TestingPrestoServer> getServers()
     {
         return ImmutableList.copyOf(servers);
@@ -388,11 +443,7 @@ public class DistributedQueryRunner
     @Override
     public void installPlugin(Plugin plugin)
     {
-        long start = nanoTime();
-        for (TestingPrestoServer server : servers) {
-            server.installPlugin(plugin);
-        }
-        log.info("Installed plugin %s in %s", plugin.getClass().getSimpleName(), nanosSince(start).convertToMostSuccinctTimeUnit());
+        installPlugin(plugin, false);
     }
 
     public void createCatalog(String catalogName, String connectorName)
@@ -443,21 +494,12 @@ public class DistributedQueryRunner
      */
     public void enableTestFunctionNamespaces(List<String> catalogNames, Map<String, String> additionalProperties)
     {
-        checkState(testFunctionNamespacesHandle.get() == null, "Test function namespaces already enabled");
+        enableTestFunctionNamespaces(catalogNames, additionalProperties, false);
+    }
 
-        String databaseName = String.valueOf(nanoTime()) + "_" + ThreadLocalRandom.current().nextInt();
-        Map<String, String> properties = ImmutableMap.<String, String>builder()
-                .put("database-name", databaseName)
-                .putAll(additionalProperties)
-                .build();
-        installPlugin(new H2FunctionNamespaceManagerPlugin());
-        for (String catalogName : catalogNames) {
-            loadFunctionNamespaceManager("h2", catalogName, properties);
-        }
-
-        Handle handle = Jdbi.open(H2ConnectionModule.getJdbcUrl(databaseName));
-        testFunctionNamespacesHandle.set(handle);
-        closer.register(handle);
+    public void enableTestFunctionNamespacesOnCoordinators(List<String> catalogNames, Map<String, String> additionalProperties)
+    {
+        enableTestFunctionNamespaces(catalogNames, additionalProperties, true);
     }
 
     public void createTestFunctionNamespace(String catalogName, String schemaName)
@@ -625,6 +667,47 @@ public class DistributedQueryRunner
         }
     }
 
+    private void enableTestFunctionNamespaces(List<String> catalogNames, Map<String, String> additionalProperties, boolean coordinatorOnly)
+    {
+        checkState(testFunctionNamespacesHandle.get() == null, "Test function namespaces already enabled");
+
+        String databaseName = String.valueOf(nanoTime()) + "_" + ThreadLocalRandom.current().nextInt();
+        Map<String, String> properties = ImmutableMap.<String, String>builder()
+                .put("database-name", databaseName)
+                .putAll(additionalProperties)
+                .build();
+        installPlugin(new H2FunctionNamespaceManagerPlugin(), coordinatorOnly);
+        for (String catalogName : catalogNames) {
+            loadFunctionNamespaceManager("h2", catalogName, properties, coordinatorOnly);
+        }
+
+        Handle handle = Jdbi.open(H2ConnectionModule.getJdbcUrl(databaseName));
+        testFunctionNamespacesHandle.set(handle);
+        closer.register(handle);
+    }
+
+    private void loadFunctionNamespaceManager(String functionNamespaceManagerName, String catalogName, Map<String, String> properties, boolean coordinatorOnly)
+    {
+        for (TestingPrestoServer server : servers) {
+            if (coordinatorOnly && !server.isCoordinator()) {
+                continue;
+            }
+            server.getMetadata().getFunctionAndTypeManager().loadFunctionNamespaceManager(functionNamespaceManagerName, catalogName, properties);
+        }
+    }
+
+    private void installPlugin(Plugin plugin, boolean coordinatorOnly)
+    {
+        long start = nanoTime();
+        for (TestingPrestoServer server : servers) {
+            if (coordinatorOnly && !server.isCoordinator()) {
+                continue;
+            }
+            server.installPlugin(plugin);
+        }
+        log.info("Installed plugin %s in %s", plugin.getClass().getSimpleName(), nanosSince(start).convertToMostSuccinctTimeUnit());
+    }
+
     private static void closeUnchecked(AutoCloseable closeable)
     {
         try {
@@ -643,6 +726,7 @@ public class DistributedQueryRunner
         private int coordinatorCount = 1;
         private Map<String, String> extraProperties = ImmutableMap.of();
         private Map<String, String> coordinatorProperties = ImmutableMap.of();
+        private Map<String, String> resourceManagerProperties = ImmutableMap.of();
         private SqlParserOptions parserOptions = DEFAULT_SQL_PARSER_OPTIONS;
         private String environment = ENVIRONMENT;
         private Optional<Path> baseDataDir = Optional.empty();
@@ -696,6 +780,12 @@ public class DistributedQueryRunner
             return this;
         }
 
+        public Builder setResourceManagerProperties(Map<String, String> resourceManagerProperties)
+        {
+            this.resourceManagerProperties = resourceManagerProperties;
+            return this;
+        }
+
         /**
          * Sets coordinator properties being equal to a map containing given key and value.
          * Note, that calling this method OVERWRITES previously set property values.
@@ -745,7 +835,7 @@ public class DistributedQueryRunner
         public DistributedQueryRunner build()
                 throws Exception
         {
-            return new DistributedQueryRunner(resourceManagerEnabled, defaultSession, nodeCount, coordinatorCount, extraProperties, coordinatorProperties, parserOptions, environment, baseDataDir, externalWorkerLauncher, extraModules);
+            return new DistributedQueryRunner(resourceManagerEnabled, defaultSession, nodeCount, coordinatorCount, extraProperties, coordinatorProperties, resourceManagerProperties, parserOptions, environment, baseDataDir, externalWorkerLauncher, extraModules);
         }
     }
 }

@@ -165,8 +165,9 @@ public class PartitionTable
 
             for (FileScanTask fileScanTask : fileScanTasks) {
                 DataFile dataFile = fileScanTask.file();
+                Types.StructType structType = fileScanTask.spec().partitionType();
                 StructLike partitionStruct = dataFile.partition();
-                StructLikeWrapper partitionWrapper = StructLikeWrapper.wrap(partitionStruct);
+                StructLikeWrapper partitionWrapper = StructLikeWrapper.forType(structType).set(partitionStruct);
 
                 if (!partitions.containsKey(partitionWrapper)) {
                     Partition partition = new Partition(
@@ -280,7 +281,7 @@ public class PartitionTable
             return value.toString();
         }
         if (type instanceof Types.BinaryType) {
-            // TODO the client sees the bytearray's tostring ouput instead of seeing actual bytes, needs to be fixed.
+            // TODO the client sees the bytearray's tostring output instead of seeing actual bytes, needs to be fixed.
             return ((ByteBuffer) value).array();
         }
         if (type instanceof Types.FloatType) {

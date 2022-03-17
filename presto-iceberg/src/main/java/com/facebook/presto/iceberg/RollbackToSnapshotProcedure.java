@@ -17,6 +17,7 @@ import com.facebook.presto.hive.HdfsEnvironment;
 import com.facebook.presto.hive.metastore.ExtendedHiveMetastore;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.connector.ConnectorMetadata;
 import com.facebook.presto.spi.procedure.Procedure;
 import com.google.common.collect.ImmutableList;
 import org.apache.iceberg.Table;
@@ -29,7 +30,9 @@ import java.lang.invoke.MethodHandle;
 import static com.facebook.presto.common.block.MethodHandleUtil.methodHandle;
 import static com.facebook.presto.common.type.StandardTypes.BIGINT;
 import static com.facebook.presto.common.type.StandardTypes.VARCHAR;
-import static com.facebook.presto.iceberg.IcebergUtil.getIcebergTable;
+import static com.facebook.presto.iceberg.CatalogType.HADOOP;
+import static com.facebook.presto.iceberg.IcebergUtil.getHiveIcebergTable;
+import static com.facebook.presto.iceberg.util.IcebergPrestoModelConverters.toIcebergTableIdentifier;
 import static java.util.Objects.requireNonNull;
 
 public class RollbackToSnapshotProcedure
@@ -45,12 +48,21 @@ public class RollbackToSnapshotProcedure
 
     private final IcebergMetadataFactory metadataFactory;
     private final HdfsEnvironment hdfsEnvironment;
+    private final IcebergResourceFactory resourceFactory;
+    private final CatalogType catalogType;
 
     @Inject
-    public RollbackToSnapshotProcedure(IcebergMetadataFactory metadataFactory, HdfsEnvironment hdfsEnvironment)
+    public RollbackToSnapshotProcedure(
+            IcebergConfig config,
+            IcebergMetadataFactory metadataFactory,
+            HdfsEnvironment hdfsEnvironment,
+            IcebergResourceFactory resourceFactory)
     {
         this.metadataFactory = requireNonNull(metadataFactory, "metadataFactory is null");
         this.hdfsEnvironment = requireNonNull(hdfsEnvironment, "hdfsEnvironment is null");
+        this.resourceFactory = requireNonNull(resourceFactory, "resourceFactory is null");
+        requireNonNull(config, "config is null");
+        this.catalogType = config.getCatalogType();
     }
 
     @Override
@@ -69,9 +81,15 @@ public class RollbackToSnapshotProcedure
     public void rollbackToSnapshot(ConnectorSession clientSession, String schema, String table, Long snapshotId)
     {
         SchemaTableName schemaTableName = new SchemaTableName(schema, table);
-        IcebergMetadata metadata = metadataFactory.create();
-        ExtendedHiveMetastore metastore = metadata.getMetastore();
-        Table icebergTable = getIcebergTable(metastore, hdfsEnvironment, clientSession, schemaTableName);
+        ConnectorMetadata metadata = metadataFactory.create();
+        Table icebergTable;
+        if (catalogType == HADOOP) {
+            icebergTable = resourceFactory.getCatalog(clientSession).loadTable(toIcebergTableIdentifier(schema, table));
+        }
+        else {
+            ExtendedHiveMetastore metastore = ((IcebergHiveMetadata) metadata).getMetastore();
+            icebergTable = getHiveIcebergTable(metastore, hdfsEnvironment, clientSession, schemaTableName);
+        }
         icebergTable.rollback().toSnapshotId(snapshotId).commit();
     }
 }

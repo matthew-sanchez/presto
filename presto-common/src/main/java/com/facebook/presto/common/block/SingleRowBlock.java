@@ -16,8 +16,10 @@ package com.facebook.presto.common.block;
 
 import org.openjdk.jol.info.ClassLayout;
 
+import java.util.OptionalInt;
 import java.util.function.BiConsumer;
 
+import static com.facebook.presto.common.block.BlockUtil.ensureBlocksAreLoaded;
 import static java.lang.String.format;
 
 public class SingleRowBlock
@@ -61,6 +63,12 @@ public class SingleRowBlock
     }
 
     @Override
+    public OptionalInt fixedSizeInBytesPerPosition()
+    {
+        return OptionalInt.empty();
+    }
+
+    @Override
     public long getRetainedSizeInBytes()
     {
         long retainedSizeInBytes = INSTANCE_SIZE;
@@ -99,17 +107,9 @@ public class SingleRowBlock
     @Override
     public Block getLoadedBlock()
     {
-        boolean allLoaded = true;
-        Block[] loadedFieldBlocks = new Block[fieldBlocks.length];
-
-        for (int i = 0; i < fieldBlocks.length; i++) {
-            loadedFieldBlocks[i] = fieldBlocks[i].getLoadedBlock();
-            if (loadedFieldBlocks[i] != fieldBlocks[i]) {
-                allLoaded = false;
-            }
-        }
-
-        if (allLoaded) {
+        Block[] loadedFieldBlocks = ensureBlocksAreLoaded(fieldBlocks);
+        if (loadedFieldBlocks == fieldBlocks) {
+            // All blocks are already loaded
             return this;
         }
         return new SingleRowBlock(rowIndex, loadedFieldBlocks);

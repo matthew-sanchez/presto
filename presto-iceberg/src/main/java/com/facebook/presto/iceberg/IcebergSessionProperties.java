@@ -13,6 +13,7 @@
  */
 package com.facebook.presto.iceberg;
 
+import com.facebook.presto.cache.CacheConfig;
 import com.facebook.presto.hive.HiveClientConfig;
 import com.facebook.presto.hive.HiveCompressionCodec;
 import com.facebook.presto.hive.OrcFileWriterConfig;
@@ -20,6 +21,7 @@ import com.facebook.presto.hive.ParquetFileWriterConfig;
 import com.facebook.presto.orc.OrcWriteValidation;
 import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.schedule.NodeSelectionStrategy;
 import com.facebook.presto.spi.session.PropertyMetadata;
 import com.google.common.collect.ImmutableList;
 import io.airlift.units.DataSize;
@@ -43,7 +45,6 @@ import static java.util.Locale.ENGLISH;
 public final class IcebergSessionProperties
 {
     private static final String COMPRESSION_CODEC = "compression_codec";
-    private static final String PARQUET_FAIL_WITH_CORRUPTED_STATISTICS = "parquet_fail_with_corrupted_statistics";
     private static final String PARQUET_MAX_READ_BLOCK_SIZE = "parquet_max_read_block_size";
     private static final String PARQUET_WRITER_BLOCK_SIZE = "parquet_writer_block_size";
     private static final String PARQUET_WRITER_PAGE_SIZE = "parquet_writer_page_size";
@@ -68,6 +69,8 @@ public final class IcebergSessionProperties
     private static final String ORC_OPTIMIZED_WRITER_MAX_STRIPE_ROWS = "orc_optimized_writer_max_stripe_rows";
     private static final String ORC_OPTIMIZED_WRITER_MAX_DICTIONARY_MEMORY = "orc_optimized_writer_max_dictionary_memory";
     private static final String ORC_COMPRESSION_CODEC = "orc_compression_codec";
+    private static final String CACHE_ENABLED = "cache_enabled";
+    private static final String NODE_SELECTION_STRATEGY = "node_selection_strategy";
     private final List<PropertyMetadata<?>> sessionProperties;
 
     @Inject
@@ -75,7 +78,8 @@ public final class IcebergSessionProperties
             IcebergConfig icebergConfig,
             HiveClientConfig hiveClientConfig,
             ParquetFileWriterConfig parquetFileWriterConfig,
-            OrcFileWriterConfig orcFileWriterConfig)
+            OrcFileWriterConfig orcFileWriterConfig,
+            CacheConfig cacheConfig)
     {
         sessionProperties = ImmutableList.of(
                 new PropertyMetadata<>(
@@ -87,11 +91,6 @@ public final class IcebergSessionProperties
                         false,
                         value -> HiveCompressionCodec.valueOf(((String) value).toUpperCase()),
                         HiveCompressionCodec::name),
-                booleanProperty(
-                        PARQUET_FAIL_WITH_CORRUPTED_STATISTICS,
-                        "Parquet: Fail when scanning Parquet files with corrupted statistics",
-                        hiveClientConfig.isFailOnCorruptedParquetStatistics(),
-                        false),
                 booleanProperty(
                         PARQUET_USE_COLUMN_NAMES,
                         "Experimental: Parquet: Access Parquet columns using names from the file",
@@ -227,7 +226,21 @@ public final class IcebergSessionProperties
                         hiveClientConfig.getOrcCompressionCodec(),
                         false,
                         value -> HiveCompressionCodec.valueOf(((String) value).toUpperCase()),
-                        HiveCompressionCodec::name));
+                        HiveCompressionCodec::name),
+                new PropertyMetadata<>(
+                        NODE_SELECTION_STRATEGY,
+                        "Node affinity selection strategy",
+                        VARCHAR,
+                        NodeSelectionStrategy.class,
+                        hiveClientConfig.getNodeSelectionStrategy(),
+                        false,
+                        value -> NodeSelectionStrategy.valueOf((String) value),
+                        NodeSelectionStrategy::toString),
+                booleanProperty(
+                        CACHE_ENABLED,
+                        "Enable cache for Iceberg",
+                        cacheConfig.isCachingEnabled(),
+                        false));
     }
 
     public List<PropertyMetadata<?>> getSessionProperties()
@@ -238,11 +251,6 @@ public final class IcebergSessionProperties
     public static HiveCompressionCodec getCompressionCodec(ConnectorSession session)
     {
         return session.getProperty(COMPRESSION_CODEC, HiveCompressionCodec.class);
-    }
-
-    public static boolean isFailOnCorruptedParquetStatistics(ConnectorSession session)
-    {
-        return session.getProperty(PARQUET_FAIL_WITH_CORRUPTED_STATISTICS, Boolean.class);
     }
 
     public static DataSize getParquetMaxReadBlockSize(ConnectorSession session)
@@ -368,5 +376,15 @@ public final class IcebergSessionProperties
     public static HiveCompressionCodec getOrcCompressionCodec(ConnectorSession session)
     {
         return session.getProperty(ORC_COMPRESSION_CODEC, HiveCompressionCodec.class);
+    }
+
+    public static boolean isCacheEnabled(ConnectorSession session)
+    {
+        return session.getProperty(CACHE_ENABLED, Boolean.class);
+    }
+
+    public static NodeSelectionStrategy getNodeSelectionStrategy(ConnectorSession session)
+    {
+        return session.getProperty(NODE_SELECTION_STRATEGY, NodeSelectionStrategy.class);
     }
 }

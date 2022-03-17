@@ -40,17 +40,33 @@ public final class IcebergQueryRunner
     public static DistributedQueryRunner createIcebergQueryRunner(Map<String, String> extraProperties)
             throws Exception
     {
-        FileFormat defaultFormat = new IcebergConfig().getFileFormat();
-        return createIcebergQueryRunner(extraProperties, defaultFormat, true);
+        return createIcebergQueryRunner(extraProperties, ImmutableMap.of());
     }
 
-    public static DistributedQueryRunner createIcebergQueryRunner(Map<String, String> extraProperties, FileFormat format)
+    public static DistributedQueryRunner createIcebergQueryRunner(Map<String, String> extraProperties, CatalogType catalogType)
             throws Exception
     {
-        return createIcebergQueryRunner(extraProperties, format, true);
+        return createIcebergQueryRunner(extraProperties, ImmutableMap.of("iceberg.catalog.type", catalogType.name()));
     }
 
-    public static DistributedQueryRunner createIcebergQueryRunner(Map<String, String> extraProperties, FileFormat format, boolean createTpchTables)
+    public static DistributedQueryRunner createIcebergQueryRunner(Map<String, String> extraProperties, Map<String, String> extraConnectorProperties)
+            throws Exception
+    {
+        FileFormat defaultFormat = new IcebergConfig().getFileFormat();
+        return createIcebergQueryRunner(extraProperties, extraConnectorProperties, defaultFormat, true);
+    }
+
+    public static DistributedQueryRunner createIcebergQueryRunner(Map<String, String> extraProperties, Map<String, String> extraConnectorProperties, FileFormat format)
+            throws Exception
+    {
+        return createIcebergQueryRunner(extraProperties, extraConnectorProperties, format, true);
+    }
+
+    public static DistributedQueryRunner createIcebergQueryRunner(
+            Map<String, String> extraProperties,
+            Map<String, String> extraConnectorProperties,
+            FileFormat format,
+            boolean createTpchTables)
             throws Exception
     {
         Session session = testSessionBuilder()
@@ -71,8 +87,10 @@ public final class IcebergQueryRunner
         queryRunner.installPlugin(new IcebergPlugin());
         Map<String, String> icebergProperties = ImmutableMap.<String, String>builder()
                 .put("hive.metastore", "file")
-                .put("hive.metastore.catalog.dir", dataDir.toString() + "/catalog")
+                .put("hive.metastore.catalog.dir", catalogDir.toFile().toURI().toString())
                 .put("iceberg.file-format", format.name())
+                .put("iceberg.catalog.warehouse", dataDir.getParent().toFile().toURI().toString())
+                .putAll(extraConnectorProperties)
                 .build();
 
         queryRunner.createCatalog(ICEBERG_CATALOG, "iceberg", icebergProperties);

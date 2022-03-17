@@ -129,12 +129,14 @@ public class QueryMonitor
                                 queryInfo.getQueryId().toString(),
                                 queryInfo.getSession().getTransactionId().map(TransactionId::toString),
                                 queryInfo.getQuery(),
+                                queryInfo.getPreparedQuery(),
                                 QUEUED.toString(),
                                 queryInfo.getSelf(),
                                 Optional.empty(),
                                 Optional.empty(),
                                 Optional.empty(),
-                                ImmutableList.of())));
+                                ImmutableList.of(),
+                                queryInfo.getSession().getTraceToken())));
     }
 
     public void queryImmediateFailureEvent(BasicQueryInfo queryInfo, ExecutionFailureInfo failure)
@@ -144,12 +146,14 @@ public class QueryMonitor
                         queryInfo.getQueryId().toString(),
                         queryInfo.getSession().getTransactionId().map(TransactionId::toString),
                         queryInfo.getQuery(),
+                        queryInfo.getPreparedQuery(),
                         queryInfo.getState().toString(),
                         queryInfo.getSelf(),
                         Optional.empty(),
                         Optional.empty(),
                         Optional.empty(),
-                        ImmutableList.of()),
+                        ImmutableList.of(),
+                        queryInfo.getSession().getTraceToken()),
                 new QueryStatistics(
                         ofMillis(0),
                         ofMillis(0),
@@ -192,7 +196,8 @@ public class QueryMonitor
                 ofEpochMilli(queryInfo.getQueryStats().getEndTime().getMillis()),
                 ofEpochMilli(queryInfo.getQueryStats().getEndTime().getMillis()),
                 ImmutableList.of(),
-                ImmutableList.of()));
+                ImmutableList.of(),
+                Optional.empty()));
 
         logQueryTimeline(queryInfo);
     }
@@ -221,7 +226,8 @@ public class QueryMonitor
                         ofEpochMilli(queryStats.getExecutionStartTime().getMillis()),
                         ofEpochMilli(queryStats.getEndTime() != null ? queryStats.getEndTime().getMillis() : 0),
                         stageStatisticsBuilder.build(),
-                        createOperatorStatistics(queryInfo)));
+                        createOperatorStatistics(queryInfo),
+                        queryInfo.getExpandedQuery()));
 
         logQueryTimeline(queryInfo);
     }
@@ -232,6 +238,7 @@ public class QueryMonitor
                 queryInfo.getQueryId().toString(),
                 queryInfo.getSession().getTransactionId().map(TransactionId::toString),
                 queryInfo.getQuery(),
+                queryInfo.getPreparedQuery(),
                 queryInfo.getState().toString(),
                 queryInfo.getSelf(),
                 createTextQueryPlan(queryInfo),
@@ -239,7 +246,8 @@ public class QueryMonitor
                 queryInfo.getOutputStage().flatMap(stage -> stageInfoCodec.toJsonWithLengthLimit(stage, maxJsonLimit)),
                 queryInfo.getRuntimeOptimizedStages().orElse(ImmutableList.of()).stream()
                         .map(stageId -> String.valueOf(stageId.getId()))
-                        .collect(toImmutableList()));
+                        .collect(toImmutableList()),
+                queryInfo.getSession().getTraceToken());
     }
 
     private List<OperatorStatistics> createOperatorStatistics(QueryInfo queryInfo)

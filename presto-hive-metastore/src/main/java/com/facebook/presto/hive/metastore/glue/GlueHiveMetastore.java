@@ -95,6 +95,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+import io.airlift.units.Duration;
 import org.apache.hadoop.fs.Path;
 import org.weakref.jmx.Flatten;
 import org.weakref.jmx.Managed;
@@ -583,7 +584,7 @@ public class GlueHiveMetastore
         com.amazonaws.services.glue.model.Table table = getGlueTableOrElseThrow(databaseName, tableName);
         ImmutableList.Builder<com.amazonaws.services.glue.model.Column> newDataColumns = ImmutableList.builder();
         newDataColumns.addAll(table.getStorageDescriptor().getColumns());
-        newDataColumns.add(convertColumn(new Column(columnName, columnType, Optional.ofNullable(columnComment))));
+        newDataColumns.add(convertColumn(new Column(columnName, columnType, Optional.ofNullable(columnComment), Optional.empty())));
         table.getStorageDescriptor().setColumns(newDataColumns.build());
         replaceGlueTable(databaseName, tableName, table);
     }
@@ -991,5 +992,11 @@ public class GlueHiveMetastore
     public Set<HivePrivilegeInfo> listTablePrivileges(MetastoreContext metastoreContext, String databaseName, String tableName, PrestoPrincipal principal)
     {
         throw new PrestoException(NOT_SUPPORTED, "listTablePrivileges is not supported by Glue");
+    }
+
+    @Override
+    public void setPartitionLeases(MetastoreContext metastoreContext, String databaseName, String tableName, Map<String, String> partitionNameToLocation, Duration leaseDuration)
+    {
+        throw new PrestoException(NOT_SUPPORTED, "setPartitionLeases is not supported by Glue");
     }
 }

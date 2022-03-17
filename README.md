@@ -4,6 +4,10 @@ Presto is a distributed SQL query engine for big data.
 
 See the [User Manual](https://prestodb.github.io/docs/current/) for deployment instructions and end user documentation.
 
+## 2021 Elections
+
+Elections are now open for all TSC seats.  [Please see here for more details](https://github.com/prestodb/tsc/blob/master/README.md#2021-elections), including how to submit your nomination.
+
 ## Requirements
 
 * Mac OS X or Linux
@@ -91,11 +95,11 @@ To learn how to build the docs, see the [docs README](presto-docs/README.md).
 
 ## Building the Web UI
 
-The Presto Web UI is composed of several React components and is written in JSX and ES6. This source code is compiled and packaged into browser-compatible Javascript, which is then checked in to the Presto source code (in the `dist` folder). You must have [Node.js](https://nodejs.org/en/download/) and [Yarn](https://yarnpkg.com/en/) installed to execute these commands. To update this folder after making changes, simply run:
+The Presto Web UI is composed of several React components and is written in JSX and ES6. This source code is compiled and packaged into browser-compatible JavaScript, which is then checked in to the Presto source code (in the `dist` folder). You must have [Node.js](https://nodejs.org/en/download/) and [Yarn](https://yarnpkg.com/en/) installed to execute these commands. To update this folder after making changes, simply run:
 
     yarn --cwd presto-main/src/main/resources/webapp/src install
 
-If no Javascript dependencies have changed (i.e., no changes to `package.json`), it is faster to run:
+If no JavaScript dependencies have changed (i.e., no changes to `package.json`), it is faster to run:
 
     yarn --cwd presto-main/src/main/resources/webapp/src run package
 

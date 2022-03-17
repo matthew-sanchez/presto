@@ -14,6 +14,7 @@
 package com.facebook.presto.orc.writer;
 
 import com.facebook.presto.common.block.Block;
+import com.facebook.presto.common.type.FixedWidthType;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.orc.ColumnWriterOptions;
 import com.facebook.presto.orc.DwrfDataEncryptor;
@@ -60,14 +61,15 @@ public class LongColumnWriter
     private static final int INSTANCE_SIZE = ClassLayout.parseClass(LongColumnWriter.class).instanceSize();
     private final int column;
     private final Type type;
+    private final long typeSize;
     private final boolean compressed;
     private final ColumnEncoding columnEncoding;
     private final LongOutputStream dataStream;
-    private final PresentOutputStream presentStream;
 
     private final List<ColumnStatistics> rowGroupColumnStatistics = new ArrayList<>();
     private final CompressedMetadataWriter metadataWriter;
     private long columnStatisticsRetainedSizeInBytes;
+    private PresentOutputStream presentStream;
 
     private final Supplier<LongValueStatisticsBuilder> statisticsBuilderSupplier;
     private LongValueStatisticsBuilder statisticsBuilder;
@@ -84,11 +86,14 @@ public class LongColumnWriter
             MetadataWriter metadataWriter)
     {
         checkArgument(column >= 0, "column is negative");
+        checkArgument(type instanceof FixedWidthType, "Type is not instance of FixedWidthType");
         requireNonNull(columnWriterOptions, "columnWriterOptions is null");
         requireNonNull(dwrfEncryptor, "dwrfEncryptor is null");
         requireNonNull(metadataWriter, "metadataWriter is null");
+
         this.column = column;
         this.type = requireNonNull(type, "type is null");
+        this.typeSize = ((FixedWidthType) type).getFixedSize();
         this.compressed = columnWriterOptions.getCompressionKind() != NONE;
         if (orcEncoding == DWRF) {
             this.columnEncoding = new ColumnEncoding(DIRECT, 0);
@@ -114,11 +119,23 @@ public class LongColumnWriter
     public void beginRowGroup()
     {
         presentStream.recordCheckpoint();
+        beginDataRowGroup();
+    }
+
+    void beginDataRowGroup()
+    {
         dataStream.recordCheckpoint();
     }
 
+    void updatePresentStream(PresentOutputStream updatedPresentStream)
+    {
+        requireNonNull(updatedPresentStream, "updatedPresentStream is null");
+        checkState(presentStream.getBufferedBytes() == 0, "Present stream has some content");
+        presentStream = updatedPresentStream;
+    }
+
     @Override
-    public void writeBlock(Block block)
+    public long writeBlock(Block block)
     {
         checkState(!closed);
         checkArgument(block.getPositionCount() > 0, "Block is empty");
@@ -129,13 +146,21 @@ public class LongColumnWriter
         }
 
         // record values
+        int nonNullValueCount = 0;
         for (int position = 0; position < block.getPositionCount(); position++) {
             if (!block.isNull(position)) {
                 long value = type.getLong(block, position);
-                dataStream.writeLong(value);
-                statisticsBuilder.addValue(value);
+                writeValue(value);
+                nonNullValueCount++;
             }
         }
+        return nonNullValueCount * typeSize + (block.getPositionCount() - nonNullValueCount) * NULL_SIZE;
+    }
+
+    void writeValue(long value)
+    {
+        dataStream.writeLong(value);
+        statisticsBuilder.addValue(value);
     }
 
     @Override

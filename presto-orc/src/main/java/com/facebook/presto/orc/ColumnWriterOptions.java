@@ -14,12 +14,15 @@
 package com.facebook.presto.orc;
 
 import com.facebook.presto.orc.metadata.CompressionKind;
+import com.facebook.presto.orc.writer.CompressionBufferPool;
+import com.facebook.presto.orc.writer.CompressionBufferPool.LastUsedCompressionBufferPool;
 import io.airlift.units.DataSize;
 
 import java.util.OptionalInt;
 
 import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MAX_COMPRESSION_BUFFER_SIZE;
 import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_MAX_STRING_STATISTICS_LIMIT;
+import static com.facebook.presto.orc.OrcWriterOptions.DEFAULT_PRESERVE_DIRECT_ENCODING_STRIPE_COUNT;
 import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
@@ -31,6 +34,10 @@ public class ColumnWriterOptions
     private final DataSize stringStatisticsLimit;
     private final boolean integerDictionaryEncodingEnabled;
     private final boolean stringDictionarySortingEnabled;
+    private final boolean stringDictionaryEncodingEnabled;
+    private final boolean ignoreDictionaryRowGroupSizes;
+    private final int preserveDirectEncodingStripeCount;
+    private final CompressionBufferPool compressionBufferPool;
 
     public ColumnWriterOptions(
             CompressionKind compressionKind,
@@ -38,7 +45,11 @@ public class ColumnWriterOptions
             DataSize compressionMaxBufferSize,
             DataSize stringStatisticsLimit,
             boolean integerDictionaryEncodingEnabled,
-            boolean stringDictionarySortingEnabled)
+            boolean stringDictionarySortingEnabled,
+            boolean stringDictionaryEncodingEnabled,
+            boolean ignoreDictionaryRowGroupSizes,
+            int preserveDirectEncodingStripeCount,
+            CompressionBufferPool compressionBufferPool)
     {
         this.compressionKind = requireNonNull(compressionKind, "compressionKind is null");
         this.compressionLevel = requireNonNull(compressionLevel, "compressionLevel is null");
@@ -47,6 +58,10 @@ public class ColumnWriterOptions
         this.stringStatisticsLimit = requireNonNull(stringStatisticsLimit, "stringStatisticsLimit is null");
         this.integerDictionaryEncodingEnabled = integerDictionaryEncodingEnabled;
         this.stringDictionarySortingEnabled = stringDictionarySortingEnabled;
+        this.stringDictionaryEncodingEnabled = stringDictionaryEncodingEnabled;
+        this.ignoreDictionaryRowGroupSizes = ignoreDictionaryRowGroupSizes;
+        this.preserveDirectEncodingStripeCount = preserveDirectEncodingStripeCount;
+        this.compressionBufferPool = requireNonNull(compressionBufferPool, "compressionBufferPool is null");
     }
 
     public CompressionKind getCompressionKind()
@@ -64,9 +79,9 @@ public class ColumnWriterOptions
         return compressionMaxBufferSize;
     }
 
-    public DataSize getStringStatisticsLimit()
+    public int getStringStatisticsLimit()
     {
-        return stringStatisticsLimit;
+        return toIntExact(stringStatisticsLimit.toBytes());
     }
 
     public boolean isIntegerDictionaryEncodingEnabled()
@@ -77,6 +92,26 @@ public class ColumnWriterOptions
     public boolean isStringDictionarySortingEnabled()
     {
         return stringDictionarySortingEnabled;
+    }
+
+    public boolean isStringDictionaryEncodingEnabled()
+    {
+        return stringDictionaryEncodingEnabled;
+    }
+
+    public boolean isIgnoreDictionaryRowGroupSizes()
+    {
+        return ignoreDictionaryRowGroupSizes;
+    }
+
+    public int getPreserveDirectEncodingStripeCount()
+    {
+        return preserveDirectEncodingStripeCount;
+    }
+
+    public CompressionBufferPool getCompressionBufferPool()
+    {
+        return compressionBufferPool;
     }
 
     public static Builder builder()
@@ -92,6 +127,10 @@ public class ColumnWriterOptions
         private DataSize stringStatisticsLimit = DEFAULT_MAX_STRING_STATISTICS_LIMIT;
         private boolean integerDictionaryEncodingEnabled;
         private boolean stringDictionarySortingEnabled = true;
+        private boolean stringDictionaryEncodingEnabled = true;
+        private boolean ignoreDictionaryRowGroupSizes;
+        private int preserveDirectEncodingStripeCount = DEFAULT_PRESERVE_DIRECT_ENCODING_STRIPE_COUNT;
+        private CompressionBufferPool compressionBufferPool = new LastUsedCompressionBufferPool();
 
         private Builder() {}
 
@@ -131,6 +170,30 @@ public class ColumnWriterOptions
             return this;
         }
 
+        public Builder setStringDictionaryEncodingEnabled(boolean stringDictionaryEncodingEnabled)
+        {
+            this.stringDictionaryEncodingEnabled = stringDictionaryEncodingEnabled;
+            return this;
+        }
+
+        public Builder setIgnoreDictionaryRowGroupSizes(boolean ignoreDictionaryRowGroupSizes)
+        {
+            this.ignoreDictionaryRowGroupSizes = ignoreDictionaryRowGroupSizes;
+            return this;
+        }
+
+        public Builder setPreserveDirectEncodingStripeCount(int preserveDirectEncodingStripeCount)
+        {
+            this.preserveDirectEncodingStripeCount = preserveDirectEncodingStripeCount;
+            return this;
+        }
+
+        public Builder setCompressionBufferPool(CompressionBufferPool compressionBufferPool)
+        {
+            this.compressionBufferPool = requireNonNull(compressionBufferPool, "compressionBufferPool is null");
+            return this;
+        }
+
         public ColumnWriterOptions build()
         {
             return new ColumnWriterOptions(
@@ -139,7 +202,11 @@ public class ColumnWriterOptions
                     compressionMaxBufferSize,
                     stringStatisticsLimit,
                     integerDictionaryEncodingEnabled,
-                    stringDictionarySortingEnabled);
+                    stringDictionarySortingEnabled,
+                    stringDictionaryEncodingEnabled,
+                    ignoreDictionaryRowGroupSizes,
+                    preserveDirectEncodingStripeCount,
+                    compressionBufferPool);
         }
     }
 }

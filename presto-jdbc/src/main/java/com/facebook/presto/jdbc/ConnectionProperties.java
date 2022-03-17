@@ -54,7 +54,9 @@ final class ConnectionProperties
     public static final ConnectionProperty<File> KERBEROS_KEYTAB_PATH = new KerberosKeytabPath();
     public static final ConnectionProperty<File> KERBEROS_CREDENTIAL_CACHE_PATH = new KerberosCredentialCachePath();
     public static final ConnectionProperty<String> ACCESS_TOKEN = new AccessToken();
+    public static final ConnectionProperty<String> TIMEZONE_ID = new TimeZoneId();
     public static final ConnectionProperty<Map<String, String>> EXTRA_CREDENTIALS = new ExtraCredentials();
+    public static final ConnectionProperty<Map<String, String>> CUSTOM_HEADERS = new CustomHeaders();
     public static final ConnectionProperty<Map<String, String>> SESSION_PROPERTIES = new SessionProperties();
     public static final ConnectionProperty<List<Protocol>> HTTP_PROTOCOLS = new HttpProtocols();
     public static final ConnectionProperty<List<QueryInterceptor>> QUERY_INTERCEPTORS = new QueryInterceptors();
@@ -78,7 +80,9 @@ final class ConnectionProperties
             .add(KERBEROS_KEYTAB_PATH)
             .add(KERBEROS_CREDENTIAL_CACHE_PATH)
             .add(ACCESS_TOKEN)
+            .add(TIMEZONE_ID)
             .add(EXTRA_CREDENTIALS)
+            .add(CUSTOM_HEADERS)
             .add(SESSION_PROPERTIES)
             .add(HTTP_PROTOCOLS)
             .add(QUERY_INTERCEPTORS)
@@ -299,6 +303,15 @@ final class ConnectionProperties
         }
     }
 
+    private static class TimeZoneId
+            extends AbstractConnectionProperty<String>
+    {
+        public TimeZoneId()
+        {
+            super("timeZoneId", NOT_REQUIRED, ALLOWED, STRING_CONVERTER);
+        }
+    }
+
     private static class ExtraCredentials
             extends AbstractConnectionProperty<Map<String, String>>
     {
@@ -308,6 +321,14 @@ final class ConnectionProperties
         }
     }
 
+    private static class CustomHeaders
+            extends AbstractConnectionProperty<Map<String, String>>
+    {
+        public CustomHeaders()
+        {
+            super("customHeaders", NOT_REQUIRED, ALLOWED, STRING_MAP_CONVERTER);
+        }
+    }
     private static class SessionProperties
             extends AbstractConnectionProperty<Map<String, String>>
     {
